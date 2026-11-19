@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use gitserve::server;
 use gitserve::store::Store;
@@ -337,6 +338,8 @@ fn a_truncated_request_is_refused() {
     stream.write_all(head.as_bytes()).unwrap();
     stream.write_all(b"0000").unwrap();
     stream.shutdown(std::net::Shutdown::Write).unwrap();
+    // A server that kept the connection open would fail the test rather than hang it.
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
 
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
