@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 
 use crate::ingest::StoreIngest;
 use crate::repository;
-use crate::store::Store;
+use crate::store::{AccessError, Store};
 
 /// A Git service, which the client names in the URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,14 +217,20 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request) -> Respons
         let access = |dir: &Path| run(dir, &task_request, &body);
         // Pushing changes the repository, everything else only reads it.
         let accessed = if task_request.service == Service::ReceivePack && !task_request.advertise {
-            store.change(&task_request.name, access)
+            store
+                .change(&task_request.name, access)
+                .map(|changed| match changed.saved {
+                    Ok(()) => changed.value,
+                    Err(err) => discard_push(&body, err),
+                })
         } else {
             store.view(&task_request.name, access)
         };
 
         match accessed {
             Ok((output, result)) => Served::Ran { output, result },
-            Err(_) => Served::NotFound,
+            Err(AccessError::Lookup(_)) => Served::NotFound,
+            Err(AccessError::Load(err)) => Served::Failed(err),
         }
     })
     .await;
@@ -232,6 +238,10 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request) -> Respons
     let (output, result) = match served {
         Ok(Served::Ran { output, result }) => (output, result),
         Ok(Served::NotFound) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(Served::Failed(err)) => {
+            log::error!("{} {}: {err:#}", request.service.as_str(), request.name);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "the request failed").into_response();
+        }
         Ok(Served::UnreadableBody(err)) => {
             log::warn!(
                 "Reading a request for {} {}: {err:#}",
@@ -273,11 +283,63 @@ enum Served {
     UnreadableBody(anyhow::Error),
     /// No repository is served under the name of the request.
     NotFound,
+    /// The store cannot be accessed.
+    Failed(anyhow::Error),
     /// The service ran: its output, and whether it succeeded.
     Ran {
         output: Vec<u8>,
         result: anyhow::Result<()>,
     },
+}
+
+/// Returns the response to a push that the store could not record, and discarded: the error, which makes the push
+/// fail on the client, rather than the report of a push that looks done.
+///
+/// With a side-band channel, the error goes on its error band, which the client displays as a `remote:` message;
+/// without one, the response is left empty, for the handler to answer with an HTTP error.
+fn discard_push(body: &[u8], err: anyhow::Error) -> (Vec<u8>, anyhow::Result<()>) {
+    let err = err.context("the push could not be saved, and was discarded");
+    let output = if requests_side_band(body) {
+        error_band(&format!("gitserve: {err:#}"))
+    } else {
+        Vec::new()
+    };
+    (output, Err(err))
+}
+
+/// Reports whether the push request in `body` asks for a side-band channel, among the capabilities that follow
+/// a NUL byte on its first packet line.
+fn requests_side_band(body: &[u8]) -> bool {
+    let length = body
+        .get(..4)
+        .and_then(|hex| std::str::from_utf8(hex).ok())
+        .and_then(|hex| usize::from_str_radix(hex, 16).ok());
+    let Some(line) = length.and_then(|length| body.get(4..length)) else {
+        return false;
+    };
+    let Some(nul) = line.iter().position(|&byte| byte == 0) else {
+        return false;
+    };
+
+    String::from_utf8_lossy(&line[nul + 1..])
+        .split_whitespace()
+        .any(|capability| matches!(capability, "side-band" | "side-band-64k"))
+}
+
+/// Returns `message` on the error band of a side-band channel, followed by a flush packet. The message is cut to
+/// fit a packet of the side-band, the smallest of both variants.
+fn error_band(message: &str) -> Vec<u8> {
+    const MAX_MESSAGE: usize = 1000 - 5;
+    let mut end = message.len().min(MAX_MESSAGE);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut packet = format!("{:04x}", end + 5).into_bytes();
+    packet.push(3);
+    packet.extend_from_slice(&message.as_bytes()[..end]);
+    packet.extend_from_slice(b"0000");
+    packet
 }
 
 /// Returns the content of a request body, decompressing it when it is gzipped.
@@ -462,6 +524,31 @@ mod tests {
         assert_eq!(decode_body(Bytes::from_static(b"0000"), false).unwrap(), b"0000");
         assert_eq!(decode_body(gzipped, true).unwrap(), b"0000");
         assert!(decode_body(Bytes::from_static(b"not gzip"), true).is_err());
+    }
+
+    #[test]
+    fn requests_side_band_reads_the_capabilities() {
+        let zero = "0".repeat(40);
+        let request = |capabilities: &str| {
+            let line = format!("{zero} {zero} refs/heads/main\0{capabilities}\n");
+            format!("{:04x}{line}0000", line.len() + 4).into_bytes()
+        };
+
+        assert!(requests_side_band(&request("report-status side-band-64k agent=git/2")));
+        assert!(requests_side_band(&request("side-band")));
+        assert!(!requests_side_band(&request("report-status agent=git/2")));
+        assert!(!requests_side_band(b"0000"));
+        assert!(!requests_side_band(b""));
+        assert!(!requests_side_band(b"zzzz"));
+        assert!(!requests_side_band(b"0100short"));
+    }
+
+    #[test]
+    fn error_band_is_a_packet_of_the_error_band() {
+        assert_eq!(error_band("failed"), b"000b\x03failed0000");
+        let long = error_band(&"é".repeat(1000));
+        assert_eq!(&long[..4], b"03e7");
+        assert_eq!(long.len(), 0x3e7 + 4);
     }
 
     #[test]

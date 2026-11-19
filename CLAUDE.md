@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 so they can be cloned/pushed with `git clone http://localhost:8085/<repo>` without a public forge.
 It is the Rust translation of the Go project [gitserve](https://github.com/corebreaker/gitserve):
 its behavior, command line and archive format are the reference, and the Go ecosystem is replaced by the Rust one.
-The repositories live in a store: a directory, or a zip archive loaded in memory.
+The repositories live in a store: a directory, or a zip archive, extracted to a temporary directory.
 
 The goal is decentralized collaboration: bare repositories carried on a USB key or any other medium,
 served with zero setup so that collaborators can clone and push without a forge. Simplicity is the point.
@@ -16,10 +16,10 @@ Security is deliberately out of scope: no authentication, no access control,
 and listening on all interfaces is intended. Do not add them, and do not flag their absence in reviews.
 
 The crate holds a library (`src/lib.rs`) and the binary (`src/main.rs`, command line), one module per concern,
-each with its unit tests: `server.rs` (HTTP), `store.rs` (stores), `repository.rs` (repositories)
-and `ingest.rs` (pushed packs). `tests/e2e.rs` drives the real `git` client against the server.
-The translation is in progress: zip archive stores (#6) and the graceful shutdown (#7) of the Go project
-are still to come; until then, a store whose path ends with `.zip` is refused.
+each with its unit tests: `server.rs` (HTTP), `store.rs` (stores), `archive.rs` (zip archives),
+`repository.rs` (repositories) and `ingest.rs` (pushed packs). `tests/e2e.rs` drives the real `git` client
+against the server; `tests/fixtures/go-store.zip` is an archive made by the Go project (see `GO_FIXTURE_HEAD`).
+The translation is in progress: the graceful shutdown (#7) of the Go project is still to come.
 
 ## Language
 
@@ -37,6 +37,7 @@ cargo test <filter>                               # run only the tests whose nam
 cargo run -- serve gitroot                        # serve ./gitroot on port 8085 (foreground)
 cargo run -- serve -p 9000 --prefix git gitroot   # serve it on port 9000, under the URL path /git/
 cargo run -- init repos                           # create an empty store
+cargo run -- create repos.zip team/tools          # create a repository in a zip archive store, created if needed
 cargo run -- create -b master gitroot team/tools  # create a bare repository, HEAD on master (main by default)
 cargo run -- delete gitroot team/tools            # delete a repository, also found with a .git suffix
 cargo run -- list gitroot                         # list the repositories of a store
@@ -128,10 +129,25 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   When a fetch or a push fails after writing a response, that response is still sent, since it reports the failure
   to the client; a failed advertisement always answers a 500.
   The `# service=` announcement of an advertisement is written by gitserve, for protocol v0 only.
-- `store.rs`: a `Store` is a directory of repositories, with one `RwLock` per repository: `view` gives shared
-  access, `change` exclusive access; a push runs under `change`, since `storage-git-gix` takes no writer lock.
-  Locks are keyed by the canonical path, so that every spelling of a repository (case, symbolic link) shares one.
+- `store.rs`: a `Store` holds the repositories, in a directory or in a zip archive (any path ending with `.zip`).
+  `view` gives shared access, `change` exclusive access; a push runs under `change`,
+  since `storage-git-gix` takes no writer lock. A directory store has one `RwLock` per repository, keyed by
+  the canonical path, so that every spelling of a repository (case, symbolic link) shares one.
   A `GixStore` is opened for each request, so that it sees what other processes wrote.
+- An archive store extracts the archive into a temporary directory, its image, under a single `RwLock`:
+  writing the archive covers every repository. `change` writes the archive back to its file afterwards,
+  and returns whether it did (`Changed::saved`); `create_repositories` and `delete_repositories` run all their names
+  in one change and write once. The image is reloaded when the size or the modification time of the file changes,
+  as when another gitserve command writes it. When a write fails, the stamp is cleared: the next access reloads
+  the file, which discards the change. The server then replaces the response to the push with an error
+  on the error band of the side-band, when the client asked for one (an HTTP 500 otherwise): the push fails
+  on the client, which displays the reason as a `remote:` message.
+  Another process writing the archive between a reload and a write of the server is not detected: its change is lost.
+- `archive.rs` converts between zip and a directory, with the format of the Go project, in both directions:
+  the repositories at the root, a `.gitserve` marker recording the format version (`{"version":1}`, added to an
+  archive without marker on its next write), files under `objects/` stored without compression.
+  An archive is written to a temporary file next to it, then renamed over it, keeping its permissions;
+  entries escaping the image are refused, and `.gitserve-*` directories are left out.
 - `repository.rs`: a repository is a directory holding `HEAD` and `config` files. A name is a slash-separated path
   checked by `check_name`; `find_repository` also tries it with a `.git` suffix. The hash kind (SHA-1 or SHA-256)
   comes from `extensions.objectFormat` in `config`. `GixStore` reads that entry again, with a plain scan that

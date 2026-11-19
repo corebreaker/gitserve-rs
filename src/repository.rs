@@ -93,7 +93,7 @@ fn strip_comment(line: &str) -> &str {
 
 /// The start of the names of the directories in which repositories are built or torn down. `list_repositories`
 /// skips them.
-const STAGING_PREFIX: &str = ".gitserve-";
+pub(crate) const STAGING_PREFIX: &str = ".gitserve-";
 
 /// Checks that `branch` can name the branch of a new repository, with the rules of `git check-ref-format --branch`.
 pub fn check_branch(branch: &str) -> anyhow::Result<()> {
