@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use gitserve::store::{self, Applied, Store};
@@ -119,15 +120,63 @@ fn run_server(path: &Path, port: u16, prefix: &str) -> anyhow::Result<()> {
         log::info!("Initialized empty store {}", path.display());
     }
 
-    let store = Store::open(path)?;
+    let store = Arc::new(Store::open(path)?);
     let prefix = server::normalize_prefix(prefix);
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
+    let served = runtime.block_on(async {
+        let signal = shutdown_signal()?;
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
         let port = listener.local_addr()?.port();
         log::info!("Serving {} on port {port}, under {prefix}", path.display());
-        server::serve(listener, server::router(store, prefix)).await?;
-        Ok(())
+
+        let shutdown = async move {
+            log::info!("Received {}, shutting down", signal.await);
+        };
+        let router = server::router(Arc::clone(&store), prefix);
+        server::serve(listener, router, shutdown, server::SHUTDOWN_GRACE).await?;
+        anyhow::Ok(())
+    });
+
+    // Let a change in progress, such as an archive being written back, complete, and refuse the later ones. Dropping
+    // the runtime then closes the connections left open, once its blocking tasks completed; the store is dropped last,
+    // which removes the image of an archive.
+    store.close();
+    drop(runtime);
+    drop(store);
+    served
+}
+
+/// Returns a future that completes with the name of the first signal asking the server to stop: SIGINT (Ctrl+C) or
+/// SIGTERM on Unix, Ctrl+C or the closing of the console on Windows. The handlers are installed at once, so that
+/// no signal is missed while the server starts.
+#[cfg(unix)]
+fn shutdown_signal() -> std::io::Result<impl Future<Output = &'static str>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        }
+    })
+}
+
+/// Returns a future that completes with the name of the first signal asking the server to stop: SIGINT (Ctrl+C) or
+/// SIGTERM on Unix, Ctrl+C or the closing of the console on Windows. The handlers are installed at once, so that
+/// no signal is missed while the server starts.
+#[cfg(windows)]
+fn shutdown_signal() -> std::io::Result<impl Future<Output = &'static str>> {
+    use tokio::signal::windows::{ctrl_c, ctrl_close};
+
+    let mut interrupt = ctrl_c()?;
+    let mut close = ctrl_close()?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => "Ctrl+C",
+            _ = close.recv() => "the closing of the console",
+        }
     })
 }
 

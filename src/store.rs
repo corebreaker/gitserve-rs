@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use tempfile::TempDir;
@@ -49,6 +50,9 @@ pub enum AccessError {
     /// The archive of the store cannot be loaded.
     #[error("{0:#}")]
     Load(anyhow::Error),
+    /// The store is closed, as the server shuts down.
+    #[error("the store is closed")]
+    Closed,
 }
 
 /// What a change gives back: the result of the access, and whether the store recorded what it changed.
@@ -75,6 +79,8 @@ pub struct Applied {
 #[derive(Debug)]
 pub struct Store {
     backend: Backend,
+    /// Set by [`Store::close`]: accesses are then refused.
+    closed: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -115,6 +121,7 @@ impl Store {
                 root: root.into(),
                 locks: Mutex::default(),
             }),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -136,6 +143,7 @@ impl Store {
                     path: path.to_path_buf(),
                     image: RwLock::new(image),
                 }),
+                closed: AtomicBool::new(false),
             })
         } else if meta.is_dir() {
             Ok(Self::new(path))
@@ -154,9 +162,11 @@ impl Store {
                 let dir = repository::find_repository(&directory.root, name)?;
                 let lock = directory.lock(&dir);
                 let _guard = lock.read().unwrap_or_else(PoisonError::into_inner);
+                self.check_open()?;
                 Ok(access(&dir))
             }
             Backend::Archive(archive) => archive.read(|root| {
+                self.check_open()?;
                 let dir = repository::find_repository(root, name)?;
                 Ok(access(&dir))
             })?,
@@ -173,12 +183,14 @@ impl Store {
                 let dir = repository::find_repository(&directory.root, name)?;
                 let lock = directory.lock(&dir);
                 let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
+                self.check_open()?;
                 Ok(Changed {
                     value: access(&dir),
                     saved: Ok(()),
                 })
             }
             Backend::Archive(archive) => archive.write(|root| {
+                self.check_open()?;
                 let dir = repository::find_repository(root, name)?;
                 Ok(access(&dir))
             }),
@@ -221,6 +233,11 @@ impl Store {
         operation: impl Fn(&Path, &str) -> anyhow::Result<String>,
     ) -> Applied {
         let mut applied = Applied::default();
+        if let Err(err) = self.check_open() {
+            applied.errors.push(err.into());
+            return applied;
+        }
+
         let mut run = |root: &Path, name: &str| match operation(root, name) {
             Ok(report) => applied.done.push(report),
             Err(err) => applied.errors.push(err.context(name.to_string())),
@@ -241,6 +258,11 @@ impl Store {
             }
             Backend::Archive(archive) => {
                 let mut image = archive.image.write().unwrap_or_else(PoisonError::into_inner);
+                // The store may have been closed while this operation waited for the lock.
+                if let Err(err) = self.check_open() {
+                    applied.errors.push(err.into());
+                    return applied;
+                }
                 if let Err(err) = archive.reload_if_changed(&mut image) {
                     applied.errors.push(err);
                     return applied;
@@ -265,21 +287,35 @@ impl Store {
 
     /// Returns the directories of the repositories of the store, in lexical order.
     pub fn repositories(&self) -> anyhow::Result<Vec<String>> {
+        self.check_open()?;
         match &self.backend {
             Backend::Directory(directory) => repository::list_repositories(&directory.root),
             Backend::Archive(archive) => archive.read(repository::list_repositories).map_err(|err| match err {
                 AccessError::Load(err) => err,
-                AccessError::Lookup(err) => err.into(),
+                err => err.into(),
             })?,
         }
     }
 
-    /// Waits for the change in progress, if any, and prevents any other access to an archive store from starting,
-    /// so that the process can exit without interrupting the write of an archive. The image of an archive store is
-    /// left in the temporary directory: the store must be dropped to remove it.
+    /// Closes the store: the accesses that have not started yet are refused with [`AccessError::Closed`], and the
+    /// change of an archive store in progress, if any, completes before `close` returns, so that the process can exit
+    /// without interrupting the write of an archive.
+    ///
+    /// Refusing rather than holding back the later accesses lets their tasks end, and release the store: the image of
+    /// an archive store is removed from the temporary directory once the store is dropped.
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         if let Backend::Archive(archive) = &self.backend {
-            std::mem::forget(archive.image.write().unwrap_or_else(PoisonError::into_inner));
+            drop(archive.image.write().unwrap_or_else(PoisonError::into_inner));
+        }
+    }
+
+    /// Fails once the store is closed.
+    fn check_open(&self) -> Result<(), AccessError> {
+        if self.closed.load(Ordering::SeqCst) {
+            Err(AccessError::Closed)
+        } else {
+            Ok(())
         }
     }
 }
@@ -544,41 +580,66 @@ mod tests {
     }
 
     #[test]
-    fn close_waits_for_the_change_in_progress_and_holds_back_the_others() {
+    fn close_waits_for_the_change_in_progress_and_refuses_the_others() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repos.zip");
         init_store(&path).unwrap();
-        let store: &'static Store = Box::leak(Box::new(Store::open(&path).unwrap()));
+        let store = Store::open(&path).unwrap();
         store.create_repositories(&names(&["repo"]), "main");
 
-        let started = Arc::new(Barrier::new(2));
-        let finished = Arc::new(AtomicUsize::new(0));
-        let change = {
-            let (started, finished) = (Arc::clone(&started), Arc::clone(&finished));
-            thread::spawn(move || {
-                store.change("repo", |_| {
+        let started = Barrier::new(2);
+        let finished = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            let change = scope.spawn(|| {
+                store.change("repo", |dir| {
                     started.wait();
                     thread::sleep(Duration::from_millis(100));
+                    fs::write(dir.join("description"), "saved").unwrap();
                     finished.store(1, Ordering::SeqCst);
                 })
-            })
+            });
+
+            started.wait();
+            store.close();
+            assert_eq!(
+                finished.load(Ordering::SeqCst),
+                1,
+                "close returned before the change in progress finished"
+            );
+            assert!(change.join().unwrap().unwrap().saved.is_ok());
+        });
+
+        // The change in progress reached the archive, and the accesses after close are refused at once.
+        assert!(matches!(store.view("repo", |_| ()), Err(AccessError::Closed)));
+        assert!(matches!(store.change("repo", |_| ()), Err(AccessError::Closed)));
+        assert!(store.repositories().is_err());
+        assert_eq!(store.create_repositories(&names(&["other"]), "main").errors.len(), 1);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.repositories().unwrap(), ["repo"]);
+        assert!(reopened.view("repo", |dir| dir.join("description").exists()).unwrap());
+
+        // Dropping the store removes its image.
+        let image = match &store.backend {
+            Backend::Archive(archive) => archive.image.read().unwrap().dir.path().to_path_buf(),
+            Backend::Directory(_) => unreachable!(),
         };
+        assert!(image.is_dir());
+        drop(store);
+        assert!(!image.exists());
+    }
 
-        started.wait();
+    #[test]
+    fn a_closed_directory_store_refuses_accesses() {
+        let root = tempfile::tempdir().unwrap();
+        make_repository(&root.path().join("repo"));
+        let store = Store::new(root.path());
+
         store.close();
-        assert_eq!(
-            finished.load(Ordering::SeqCst),
-            1,
-            "close returned before the change in progress finished"
-        );
-        assert!(change.join().unwrap().unwrap().saved.is_ok());
-
-        // An access that starts after close never runs. Its thread stays blocked, and ends with the test process.
-        let accessed = Arc::new(AtomicUsize::new(0));
-        let access = Arc::clone(&accessed);
-        thread::spawn(move || store.view("repo", |_| access.store(1, Ordering::SeqCst)));
-        thread::sleep(Duration::from_millis(100));
-        assert_eq!(accessed.load(Ordering::SeqCst), 0, "an access ran after close");
+        assert!(matches!(store.view("repo", |_| ()), Err(AccessError::Closed)));
+        assert!(matches!(store.change("repo", |_| ()), Err(AccessError::Closed)));
+        assert!(store.repositories().is_err());
+        assert_eq!(store.delete_repositories(&names(&["repo"])).errors.len(), 1);
+        assert!(root.path().join("repo").exists());
     }
 
     #[test]

@@ -56,7 +56,8 @@ impl Fixture {
             runtime.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
                 port_sender.send(listener.local_addr().unwrap().port()).unwrap();
-                server::serve(listener, server::router(store, "/git/".to_string()))
+                let router = server::router(std::sync::Arc::new(store), "/git/".to_string());
+                server::serve(listener, router, std::future::pending(), server::SHUTDOWN_GRACE)
                     .await
                     .unwrap();
             });
