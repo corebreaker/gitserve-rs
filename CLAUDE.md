@@ -71,6 +71,11 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
 
 - CircleCI (`.circleci/config.yml`) runs three jobs on `cimg/rust`: `lint` (`cargo fmt --check`, `cargo clippy`),
   `build` and `test`, all with `--locked`. Images are pulled with `$DOCKERHUB_ACCESS_TOKEN`.
+- A `coverage` workflow of its own runs the tests instrumented on `corebreaker/rust-devtools-circleci`,
+  then uploads the grcov report to Coveralls with `$COVERALLS_REPO_TOKEN`. It repeats the steps of the `coverage.sh`
+  of that image, whose `--keep-only '*/src/*'` leaves out a crate at the root: its report would be empty.
+  That image ships Rust 1.97 and git 2.39, older than `cimg/rust`: the tests must pass with both.
+  Before git 2.42, a clone of an empty SHA-256 repository is made with SHA-1.
 - Branch protection on `main` should require the `all-checks` check from the `circleci-checks` app (id 18001),
   named after the CircleCI workflow. Renaming that workflow blocks every merge
   until the required check is updated in the protection of `main`.

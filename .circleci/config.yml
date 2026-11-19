@@ -1,6 +1,8 @@
 version: 2.1
 
 # The gitserve gate, split across jobs so a failure names the offending check.
+# `coverage` runs in a workflow of its own, on the corebreaker devtools image for its grcov/coveralls tooling,
+# so that the required `all-checks` check does not depend on Coveralls.
 
 executors:
   rust:
@@ -60,7 +62,40 @@ jobs:
           name: Run tests
           command: "cargo test --locked"
 
+  coverage:
+    docker:
+      - image: corebreaker/rust-devtools-circleci:rust-1.97.0-v0.4.7
+        auth:
+          username: corebreaker
+          password: $DOCKERHUB_ACCESS_TOKEN
+    steps:
+      - checkout
+      # The steps of the coverage.sh script of the image, whose `--keep-only '*/src/*'` misses a crate at the root.
+      - run:
+          name: Run tests with coverage
+          command: "cargo test --locked --all-targets"
+          environment:
+            RUSTFLAGS: "-Cinstrument-coverage"
+            LLVM_PROFILE_FILE: "/home/circleci/project/target/profile/%p-%m.profraw"
+            CARGO_INCREMENTAL: "0"
+      - run:
+          name: Make coverage
+          command: >-
+            mkdir -p target/coverage &&
+            grcov ./target/profile -s . -b ./target/debug -t coveralls+ --token "$COVERALLS_REPO_TOKEN"
+            --excl-line 'unreachable!' --excl-start '// no-coverage:start' --excl-stop '// no-coverage:stop'
+            --keep-only 'src/*' --llvm --ignore-not-existing -o target/coverage/coveralls.json
+      - run:
+          name: Upload Coverage Result To Coveralls
+          command: "coveralls circleci -r gitserve-rs -t $COVERALLS_REPO_TOKEN target/coverage/coveralls.json"
+      - store_artifacts:
+          path: target/coverage
+
 workflows:
+  coverage:
+    jobs:
+      - coverage
+
   all-checks:
     jobs:
       - lint

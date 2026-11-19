@@ -602,6 +602,25 @@ mod tests {
     }
 
     #[test]
+    fn an_archive_that_cannot_be_reloaded_fails_the_accesses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.zip");
+        init_store(&path).unwrap();
+        let store = Store::open(&path).unwrap();
+        store.create_repositories(&names(&["repo"]), "main");
+
+        // Another size changes the stamp of the file, which the next access then reloads.
+        fs::write(
+            &path,
+            "not a zip archive, and longer than the archive it replaces".repeat(100),
+        )
+        .unwrap();
+        assert!(store.repositories().is_err());
+        assert!(matches!(store.view("repo", |_| ()), Err(AccessError::Load(_))));
+        assert_eq!(store.create_repositories(&names(&["other"]), "main").errors.len(), 1);
+    }
+
+    #[test]
     fn close_waits_for_the_change_in_progress_and_refuses_the_others() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repos.zip");
