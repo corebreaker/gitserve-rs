@@ -1,4 +1,5 @@
 [![Crates.io]](https://crates.io/crates/gitserve)
+[![Docs.rs]](https://docs.rs/gitserve/)
 [![CircleCI]](https://circleci.com/gh/corebreaker/gitserve-rs/tree/main)
 [![Coverage Status]](https://coveralls.io/github/corebreaker/gitserve-rs?branch=main)
 [![License]](https://github.com/corebreaker/gitserve-rs/blob/main/LICENSE)
@@ -114,6 +115,7 @@ It uses gunnar-wire, licensed under the AGPL-3.0:
 the source of a server built from it must be offered to its network users, which this repository does.
 
 [Crates.io]: https://img.shields.io/crates/v/gitserve?style=for-the-badge
+[Docs.rs]: https://img.shields.io/docsrs/gitserve?style=for-the-badge
 [CircleCI]: https://img.shields.io/circleci/build/github/corebreaker/gitserve-rs/main?style=for-the-badge
 [Coverage Status]: https://img.shields.io/coveralls/github/corebreaker/gitserve-rs/main?style=for-the-badge
 [License]: https://img.shields.io/github/license/corebreaker/gitserve-rs?style=for-the-badge
