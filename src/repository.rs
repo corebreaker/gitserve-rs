@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use gix_hash::Kind;
 
 /// Why a name does not lead to a repository.
@@ -94,12 +95,17 @@ fn strip_comment(line: &str) -> &str {
 /// skips them.
 const STAGING_PREFIX: &str = ".gitserve-";
 
-/// Checks that `branch` can name the branch of a new repository.
+/// Checks that `branch` can name the branch of a new repository, with the rules of `git check-ref-format --branch`.
 pub fn check_branch(branch: &str) -> anyhow::Result<()> {
+    // Validating the full reference cannot apply the rules on the start of the branch name: a branch name may not
+    // start with a dash, which would read as an option.
     let reference = format!("refs/heads/{branch}");
-    gix_validate::reference::branch_name(reference.as_str().into())
-        .map(|_| ())
-        .map_err(|_| anyhow::anyhow!("invalid branch name {branch:?}"))
+    let valid = !branch.starts_with('-') && gix_validate::reference::branch_name(reference.as_str().into()).is_ok();
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid branch name {branch:?}")
+    }
 }
 
 /// Creates an empty bare repository named `name` in `root`, with `HEAD` pointing to `branch`.
@@ -109,6 +115,10 @@ pub fn check_branch(branch: &str) -> anyhow::Result<()> {
 pub fn create_repository(root: &Path, name: &str, branch: &str) -> anyhow::Result<()> {
     check_name(name)?;
     check_branch(branch)?;
+    if name.split('/').any(|element| element.starts_with(STAGING_PREFIX)) {
+        anyhow::bail!("{name}: the names starting with {STAGING_PREFIX} are reserved to gitserve");
+    }
+
     if let Ok(dir) = find_repository(root, name) {
         anyhow::bail!("repository {} already exists", relative_name(root, &dir));
     }
@@ -118,24 +128,25 @@ pub fn create_repository(root: &Path, name: &str, branch: &str) -> anyhow::Resul
         anyhow::bail!("{name} already exists");
     }
 
-    let mut ancestor = String::new();
-    for element in name.split('/').take(name.split('/').count() - 1) {
-        if !ancestor.is_empty() {
-            ancestor.push('/');
-        }
-        ancestor.push_str(element);
-        if is_repository(&root.join(&ancestor)) {
+    for (end, _) in name.match_indices('/') {
+        let ancestor = &name[..end];
+        if is_repository(&root.join(ancestor)) {
             anyhow::bail!("{name} would be inside repository {ancestor}");
         }
     }
 
     let parent = target.parent().unwrap_or(root);
-    fs::create_dir_all(parent)?;
-    let staging = tempfile::Builder::new().prefix(STAGING_PREFIX).tempdir_in(parent)?;
-    let store = storage_git_gix::GixStore::open_or_init(staging.path().join("repo"), Kind::Sha1)?;
-    drop(store);
-    fs::write(staging.path().join("repo/HEAD"), format!("ref: refs/heads/{branch}\n"))?;
-    fs::rename(staging.path().join("repo"), &target)?;
+    fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .tempdir_in(parent)
+        .with_context(|| format!("cannot create a directory in {}", parent.display()))?;
+    let built = staging.path().join("repo");
+    drop(storage_git_gix::GixStore::open_or_init(&built, Kind::Sha1)?);
+    let head = built.join("HEAD");
+    fs::write(&head, format!("ref: refs/heads/{branch}\n"))
+        .with_context(|| format!("cannot write {}", head.display()))?;
+    fs::rename(&built, &target).with_context(|| format!("cannot move the repository to {}", target.display()))?;
     Ok(())
 }
 
@@ -143,13 +154,25 @@ pub fn create_repository(root: &Path, name: &str, branch: &str) -> anyhow::Resul
 /// to `root`.
 ///
 /// The repository is first renamed to a hidden directory, then deleted: a server running on `root` meanwhile sees
-/// it vanish at once, not half deleted.
+/// it vanish at once, not half deleted. Once renamed, the repository is gone from the store: failing to delete the
+/// hidden directory only warrants a warning.
 pub fn delete_repository(root: &Path, name: &str) -> anyhow::Result<String> {
     let dir = find_repository(root, name)?;
     let parent = dir.parent().unwrap_or(root);
-    let trash = tempfile::Builder::new().prefix(STAGING_PREFIX).tempdir_in(parent)?;
-    fs::rename(&dir, trash.path().join("repo"))?;
-    trash.close()?;
+    let trash = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .tempdir_in(parent)
+        .with_context(|| format!("cannot create a directory in {}", parent.display()))?;
+    fs::rename(&dir, trash.path().join("repo")).with_context(|| format!("cannot move {}", dir.display()))?;
+
+    let leftover = trash.path().to_path_buf();
+    if let Err(err) = trash.close() {
+        log::warn!(
+            "The repository {name} is deleted, but {} is left behind: {err}",
+            leftover.display()
+        );
+    }
+
     Ok(relative_name(root, &dir))
 }
 
@@ -159,10 +182,11 @@ pub fn list_repositories(root: &Path) -> anyhow::Result<Vec<String>> {
     let mut names = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
+        let context = || format!("cannot read {}", dir.display());
+        for entry in fs::read_dir(&dir).with_context(context)? {
+            let entry = entry.with_context(context)?;
             let skipped = entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX);
-            if skipped || !entry.file_type()?.is_dir() {
+            if skipped || !entry.file_type().with_context(context)?.is_dir() {
                 continue;
             }
 
@@ -290,7 +314,7 @@ mod tests {
         for branch in ["main", "master", "feature/x", "release-1.0"] {
             assert!(check_branch(branch).is_ok(), "{branch}");
         }
-        for branch in ["", "HEAD", "a..b", "a b", "a~1", "-x/", "x.lock", "x/"] {
+        for branch in ["", "HEAD", "-x", "--force", "a..b", "a b", "a~1", "x.lock", "x/"] {
             assert!(check_branch(branch).is_err(), "{branch:?}");
         }
     }
@@ -328,6 +352,16 @@ mod tests {
             "repo.git/inner would be inside repository repo.git"
         );
         assert_eq!(error("../outside"), "invalid repository name: \"../outside\"");
+    }
+
+    #[test]
+    fn create_repository_refuses_the_staging_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [".gitserve-x", "team/.gitserve-x", ".gitserve-x/repo"] {
+            let error = create_repository(root.path(), name, "main").unwrap_err().to_string();
+            assert!(error.contains("reserved to gitserve"), "{name}: {error}");
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]

@@ -82,7 +82,12 @@ impl Store {
         repository::create_repository(&self.root, name, branch)
     }
 
-    /// Deletes the repository served under `name`, once the requests on it are over, and returns its directory.
+    /// Deletes the repository served under `name`, and returns its directory.
+    ///
+    /// The deletion waits for the requests that this `Store` serves on the repository. It cannot wait for those of
+    /// another process, such as a `serve` running on the same directory: there, the deletion renames the repository
+    /// away first, so that it vanishes at once. On Unix, a request already reading it then fails if it opens another
+    /// file of it; on Windows, the rename fails while a file of it is open, and so does the deletion.
     pub fn delete_repository(&self, name: &str) -> anyhow::Result<String> {
         self.change(name, |_| repository::delete_repository(&self.root, name))?
     }

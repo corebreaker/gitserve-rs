@@ -139,7 +139,11 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   `create_repository` builds a repository with `GixStore::open_or_init`, without the `git` binary,
   in a hidden `.gitserve-*` directory next to it, then renames it into place; `delete_repository` renames it away
   before deleting it: a server running on the same store never sees a repository half made or half deleted.
-  A repository is never created inside another one; `list_repositories` skips nested and `.gitserve-*` ones.
+  A repository is never created inside another one, and `.gitserve-*` names are reserved;
+  `list_repositories` skips nested repositories and `.gitserve-*` directories.
+  The lock of a deletion only coordinates with the requests of the same `Store`: against a `serve` of another
+  process, the rename is the only guard. On Unix, a request then fails if it opens another file of the repository;
+  on Windows, the rename, hence the deletion, fails while a file of the repository is open.
 - `ingest.rs`: `StoreIngest`, the `PackIngest` that takes a pushed pack into the store through `GitOps::put_pack`,
   which completes a thin pack. Requests and packs are held in memory, unlike the spools of the Go project.
 - `store.rs` also holds `init_store`, `ensure_store` (`serve` and `create` initialize a missing store)

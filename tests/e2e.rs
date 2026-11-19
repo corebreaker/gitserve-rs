@@ -106,16 +106,9 @@ impl Fixture {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
-    /// Runs the gitserve binary in the directory of the fixture with `args`, and returns its exit code and its
-    /// standard output and error.
+    /// Runs the gitserve binary in the directory of the fixture with `args` (see [`run_gitserve`]).
     fn gitserve(&self, args: &[&str]) -> (i32, String, String) {
-        let output = Command::new(env!("CARGO_BIN_EXE_gitserve"))
-            .args(args)
-            .current_dir(self.dir.path())
-            .output()
-            .unwrap();
-        let text = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap();
-        (output.status.code().unwrap(), text(output.stdout), text(output.stderr))
+        run_gitserve(self.dir.path(), args)
     }
 
     /// Creates the bare repository `name` in the store, with extra `git init` arguments.
@@ -145,6 +138,25 @@ impl Fixture {
             &["fsck", "--strict", "--full", "--no-progress"],
         );
     }
+}
+
+/// Runs the gitserve binary in `dir` with `args`, and returns its exit code and its standard output and error.
+fn run_gitserve(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_gitserve"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let text = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap();
+    (output.status.code().unwrap(), text(output.stdout), text(output.stderr))
+}
+
+/// Returns a directory holding an empty store `root`, for the tests that only run the binary: they need neither
+/// `git` nor a server, so they always run.
+fn workspace() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("root")).unwrap();
+    dir
 }
 
 /// Writes `lines` numbered lines tagged with `tag` to `dir/name`.
@@ -395,9 +407,9 @@ fn commands_create_list_and_delete_repositories() {
 
 #[test]
 fn create_goes_on_after_a_failure() {
-    let Some(fx) = Fixture::start() else { return };
+    let dir = workspace();
 
-    let (code, out, err) = fx.gitserve(&["create", "root", "dup", "dup", "other"]);
+    let (code, out, err) = run_gitserve(dir.path(), &["create", "root", "dup", "dup", "other"]);
     assert_eq!(code, 1);
     assert_eq!(out, "Created repository dup\nCreated repository other\n");
     assert!(err.contains("repository dup already exists"), "{err}");
@@ -405,40 +417,41 @@ fn create_goes_on_after_a_failure() {
 
 #[test]
 fn commands_initialize_stores() {
-    let Some(fx) = Fixture::start() else { return };
+    let dir = workspace();
 
-    let (code, out, _) = fx.gitserve(&["init", "stores/first"]);
+    let (code, out, _) = run_gitserve(dir.path(), &["init", "stores/first"]);
     assert_eq!((code, out.as_str()), (0, "Initialized empty store stores/first\n"));
-    assert!(fx.path("stores/first").is_dir());
-    let (code, _, err) = fx.gitserve(&["init", "stores/first"]);
+    assert!(dir.path().join("stores/first").is_dir());
+    let (code, _, err) = run_gitserve(dir.path(), &["init", "stores/first"]);
     assert_eq!(code, 1);
     assert!(err.contains("already exists"), "{err}");
 
-    let (code, out, _) = fx.gitserve(&["create", "stores/second", "repo"]);
+    let (code, out, _) = run_gitserve(dir.path(), &["create", "stores/second", "repo"]);
     assert_eq!(code, 0);
     assert_eq!(out, "Initialized empty store stores/second\nCreated repository repo\n");
 
-    let (code, _, err) = fx.gitserve(&["list", "stores/missing"]);
+    let (code, _, err) = run_gitserve(dir.path(), &["list", "stores/missing"]);
     assert_eq!(code, 1);
     assert!(err.contains("does not exist"), "{err}");
-    let (code, _, err) = fx.gitserve(&["init", "repos.zip"]);
+    let (code, _, err) = run_gitserve(dir.path(), &["init", "repos.zip"]);
     assert_eq!(code, 1);
     assert!(err.contains("not supported yet"), "{err}");
 }
 
 #[test]
 fn usage_errors_exit_with_2() {
-    let Some(fx) = Fixture::start() else { return };
+    let dir = workspace();
 
     for args in [
         &["create", "--branch", "a..b", "root", "repo"][..],
+        &["create", "--branch=-x", "root", "repo"],
         &["create", "root"],
         &["delete", "root"],
         &["list"],
         &["serve", "--port", "70000", "root"],
         &["unknown"],
     ] {
-        assert_eq!(fx.gitserve(args).0, 2, "{args:?}");
+        assert_eq!(run_gitserve(dir.path(), args).0, 2, "{args:?}");
     }
-    assert_eq!(fx.gitserve(&["list", "root"]).1, "");
+    assert_eq!(run_gitserve(dir.path(), &["list", "root"]).1, "");
 }
