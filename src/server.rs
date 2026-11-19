@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Bytes, to_bytes};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
@@ -15,11 +15,12 @@ use axum::response::{IntoResponse, Response};
 use gunnar_wire::receive_pack::{AllowAll, ReceivePack};
 use gunnar_wire::upload_pack::UploadPack;
 use gunnar_wire::{ProtocolVersion, Session};
+use percent_encoding::percent_decode_str;
 use storage_git_gix::GixStore;
 use tokio::net::TcpListener;
 
 use crate::ingest::StoreIngest;
-use crate::repository::{self, LookupError};
+use crate::repository;
 use crate::store::Store;
 
 /// A Git service, which the client names in the URL.
@@ -101,7 +102,7 @@ pub fn normalize_prefix(prefix: &str) -> String {
 }
 
 /// Routes a request to the Git service it asks for. A repository answers at `<prefix><name>/info/refs`,
-/// `<prefix><name>/git-upload-pack` and `<prefix><name>/git-receive-pack`.
+/// `<prefix><name>/git-upload-pack` and `<prefix><name>/git-receive-pack`, where the name is percent-encoded.
 pub fn route(prefix: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Result<GitRequest, RouteError> {
     let path = uri.path().strip_prefix(prefix).ok_or(RouteError::NotFound)?;
     let (name, service, advertise) = if let Some(name) = path.strip_suffix("/info/refs") {
@@ -119,9 +120,13 @@ pub fn route(prefix: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> R
     }
 
     let service = service.ok_or(RouteError::DumbProtocol)?;
+    // The decoded name may hold any character: `check_name` validates it before it reaches the file system.
+    let name = percent_decode_str(name)
+        .decode_utf8()
+        .map_err(|_| RouteError::NotFound)?;
     let version = headers.get("git-protocol").and_then(|value| value.to_str().ok());
     Ok(GitRequest {
-        name: name.to_string(),
+        name: name.into_owned(),
         service,
         advertise,
         version: ProtocolVersion::from_git_protocol(version),
@@ -180,13 +185,13 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request) -> Respons
     };
 
     let body = if request.advertise {
-        Vec::new()
+        Bytes::new()
     } else {
-        match read_body(body, &parts.headers).await {
+        match to_bytes(body, usize::MAX).await {
             Ok(body) => body,
             Err(err) => {
                 log::warn!(
-                    "Reading a request for {} {}: {err:#}",
+                    "Reading a request for {} {}: {err}",
                     request.service.as_str(),
                     request.name
                 );
@@ -195,24 +200,45 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request) -> Respons
         }
     };
 
+    let gzipped = parts
+        .headers
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"gzip"));
     let task_state = Arc::clone(&state);
     let task_request = request.clone();
     let served = tokio::task::spawn_blocking(move || {
+        // Decompressing is CPU-bound work too, kept off the async runtime.
+        let body = match decode_body(body, gzipped) {
+            Ok(body) => body,
+            Err(err) => return Served::UnreadableBody(err),
+        };
+
         let store = &task_state.store;
-        let run = |dir: &Path| run(dir, &task_request, &body);
+        let access = |dir: &Path| run(dir, &task_request, &body);
         // Pushing changes the repository, everything else only reads it.
-        if task_request.service == Service::ReceivePack && !task_request.advertise {
-            store.change(&task_request.name, run)
+        let accessed = if task_request.service == Service::ReceivePack && !task_request.advertise {
+            store.change(&task_request.name, access)
         } else {
-            store.view(&task_request.name, run)
+            store.view(&task_request.name, access)
+        };
+
+        match accessed {
+            Ok((output, result)) => Served::Ran { output, result },
+            Err(_) => Served::NotFound,
         }
     })
     .await;
 
     let (output, result) = match served {
-        Ok(Ok(served)) => served,
-        Ok(Err(LookupError::InvalidName(_) | LookupError::NotFound(_))) => {
-            return (StatusCode::NOT_FOUND, "repository not found").into_response();
+        Ok(Served::Ran { output, result }) => (output, result),
+        Ok(Served::NotFound) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(Served::UnreadableBody(err)) => {
+            log::warn!(
+                "Reading a request for {} {}: {err:#}",
+                request.service.as_str(),
+                request.name
+            );
+            return (StatusCode::BAD_REQUEST, "cannot read the request").into_response();
         }
         Err(err) => {
             log::error!("{} {}: {err}", request.service.as_str(), request.name);
@@ -222,8 +248,9 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request) -> Respons
 
     if let Err(err) = result {
         log::error!("{} {}: {err:#}", request.service.as_str(), request.name);
-        if output.is_empty() {
-            // Nothing to send yet: the failure can still show as an HTTP status.
+        // A failed fetch or push may have reported the failure to the client in its output, which must then be
+        // sent. A failed advertisement has nothing to report: what it wrote is only its start.
+        if request.advertise || output.is_empty() {
             return (StatusCode::INTERNAL_SERVER_ERROR, "the request failed").into_response();
         }
     }
@@ -240,12 +267,21 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request) -> Respons
         .into_response()
 }
 
-/// Reads the whole body of a request, decompressing it when it is gzipped.
-async fn read_body(body: Body, headers: &HeaderMap) -> anyhow::Result<Vec<u8>> {
-    let bytes = to_bytes(body, usize::MAX).await?;
-    let gzipped = headers
-        .get(header::CONTENT_ENCODING)
-        .is_some_and(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"gzip"));
+/// What the blocking part of [`handle`] gives back.
+enum Served {
+    /// The gzipped body of the request cannot be decompressed.
+    UnreadableBody(anyhow::Error),
+    /// No repository is served under the name of the request.
+    NotFound,
+    /// The service ran: its output, and whether it succeeded.
+    Ran {
+        output: Vec<u8>,
+        result: anyhow::Result<()>,
+    },
+}
+
+/// Returns the content of a request body, decompressing it when it is gzipped.
+fn decode_body(bytes: Bytes, gzipped: bool) -> anyhow::Result<Vec<u8>> {
     if !gzipped {
         return Ok(bytes.into());
     }
@@ -388,6 +424,44 @@ mod tests {
             route_to(Method::GET, "/git/repo/git-receive-pack", None),
             Err(RouteError::MethodNotAllowed(Method::POST))
         );
+    }
+
+    #[test]
+    fn route_decodes_the_name() {
+        assert_eq!(
+            route_to(Method::POST, "/git/my%20repo/git-upload-pack", None),
+            Ok(request("my repo", Service::UploadPack, false, ProtocolVersion::V0))
+        );
+        assert_eq!(
+            route_to(
+                Method::GET,
+                "/git/team/%C3%A9t%C3%A9/info/refs?service=git-upload-pack",
+                None
+            ),
+            Ok(request("team/été", Service::UploadPack, true, ProtocolVersion::V0))
+        );
+        // A decoded slash is checked with the name, as any other.
+        assert_eq!(
+            route_to(Method::POST, "/git/..%2Frepo/git-upload-pack", None),
+            Ok(request("../repo", Service::UploadPack, false, ProtocolVersion::V0))
+        );
+        assert_eq!(
+            route_to(Method::POST, "/git/%FF/git-upload-pack", None),
+            Err(RouteError::NotFound)
+        );
+    }
+
+    #[test]
+    fn decode_body_decompresses_gzip() {
+        use std::io::Write as _;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"0000").unwrap();
+        let gzipped = Bytes::from(encoder.finish().unwrap());
+
+        assert_eq!(decode_body(Bytes::from_static(b"0000"), false).unwrap(), b"0000");
+        assert_eq!(decode_body(gzipped, true).unwrap(), b"0000");
+        assert!(decode_body(Bytes::from_static(b"not gzip"), true).is_err());
     }
 
     #[test]

@@ -33,6 +33,9 @@ impl<S: GitOps> PackIngest for StoreIngest<'_, S> {
             .put_pack(&bytes)
             .map_err(|err| Error::Pack(format!("cannot store the pack: {err:#}")))?;
 
+        // The store writes the index itself, and tells neither its checksum nor the paths: they stay null and
+        // unset. receive-pack only logs the object count and the pack id, and hands the rest back in its outcome,
+        // which gitserve does not read; without an object set, the receipt weighs on no gate either.
         Ok(PackReceipt::without_object_set(IndexedPack {
             num_objects: header.num_objects,
             pack_id: header.pack_id,

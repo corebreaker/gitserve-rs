@@ -116,18 +116,22 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   `gunnar-wire` and `gunnar-store` are licensed under AGPL-3.0-only, compatible with the GPL-3.0 of gitserve:
   the combined program must offer its source to its network users, which the public repository does.
 - `server.rs`: `route` maps the smart HTTP endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`)
-  found under the URL prefix, which it strips, to a `GitRequest`; the dumb protocol is refused with a 403.
-  `handle` reads the whole request (gunzipped when needed) before accessing the store, runs the service
-  in `spawn_blocking`, since the state machines block, and sends the response once the access is over:
+  found under the URL prefix, which it strips, to a `GitRequest` whose name it percent-decodes;
+  the dumb protocol is refused with a 403. `handle` reads the whole request before accessing the store,
+  then gunzips it when needed and runs the service in `spawn_blocking`, since both block,
+  and sends the response once the access is over:
   no network transfer ever happens while a repository is locked, so a slow client cannot stall the others.
-  When a service fails after writing a response, that response is still sent, since it reports the failure
-  to the client. The `# service=` announcement of an advertisement is written by gitserve, for protocol v0 only.
+  When a fetch or a push fails after writing a response, that response is still sent, since it reports the failure
+  to the client; a failed advertisement always answers a 500.
+  The `# service=` announcement of an advertisement is written by gitserve, for protocol v0 only.
 - `store.rs`: a `Store` is a directory of repositories, with one `RwLock` per repository: `view` gives shared
   access, `change` exclusive access; a push runs under `change`, since `storage-git-gix` takes no writer lock.
+  Locks are keyed by the canonical path, so that every spelling of a repository (case, symbolic link) shares one.
   A `GixStore` is opened for each request, so that it sees what other processes wrote.
 - `repository.rs`: a repository is a directory holding `HEAD` and `config` files. A name is a slash-separated path
   checked by `check_name`; `find_repository` also tries it with a `.git` suffix. The hash kind (SHA-1 or SHA-256)
-  comes from `extensions.objectFormat` in `config`.
+  comes from `extensions.objectFormat` in `config`. `GixStore` reads that entry again, with a plain scan that
+  ignores sections and comments: a hand-written entry that only `hash_kind` understands still fails to open.
 - `ingest.rs`: `StoreIngest`, the `PackIngest` that takes a pushed pack into the store through `GitOps::put_pack`,
   which completes a thin pack. Requests and packs are held in memory, unlike the spools of the Go project.
 - `main.rs`: the command line uses clap; a usage error exits with 2, a failed command with 1.

@@ -4,6 +4,8 @@
 //! is a failure.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc;
@@ -16,7 +18,7 @@ use tempfile::TempDir;
 /// A server on a store of its own, with an isolated Git configuration for the client.
 struct Fixture {
     dir: TempDir,
-    base_url: String,
+    port: u16,
 }
 
 impl Fixture {
@@ -51,10 +53,7 @@ impl Fixture {
         });
 
         let port = port_receiver.recv().unwrap();
-        Some(Self {
-            dir,
-            base_url: format!("http://127.0.0.1:{port}/git/"),
-        })
+        Some(Self { dir, port })
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -62,7 +61,26 @@ impl Fixture {
     }
 
     fn url(&self, name: &str) -> String {
-        format!("{}{name}", self.base_url)
+        format!("http://127.0.0.1:{}/git/{name}", self.port)
+    }
+
+    /// Sends an HTTP request to the server, and returns the status code, the headers and the body of the response.
+    fn http(&self, method: &str, path: &str, headers: &[&str], body: &[u8]) -> (u16, String, Vec<u8>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        let mut request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        for header in headers {
+            request.push_str(&format!("{header}\r\n"));
+        }
+        request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let split = response.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8(response[..split].to_vec()).unwrap();
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        (status, head, response[split + 4..].to_vec())
     }
 
     /// Runs `git` in `dir` with `args`, and returns its output whether it succeeds or not.
@@ -233,9 +251,97 @@ fn a_missing_repository_is_not_found() {
     let Some(fx) = Fixture::start() else { return };
     fx.create_repository("present.git", &[]);
 
-    for name in ["missing", "present/..", "..%2Fpresent"] {
-        let url = fx.url(name);
-        let output = fx.try_git(fx.dir.path(), &["ls-remote", &url]);
-        assert!(!output.status.success(), "ls-remote {name} succeeded");
+    let advertisement = "info/refs?service=git-upload-pack";
+    assert_eq!(
+        fx.http("GET", &format!("/git/present/{advertisement}"), &[], b"").0,
+        200
+    );
+    for name in ["missing", "present/..", "..%2Fpresent", "%2E%2E", "present%5C"] {
+        let path = format!("/git/{name}/{advertisement}");
+        assert_eq!(fx.http("GET", &path, &[], b"").0, 404, "{path}");
+    }
+    assert_eq!(
+        fx.http("GET", &format!("/other/present/{advertisement}"), &[], b"").0,
+        404
+    );
+
+    let output = fx.try_git(fx.dir.path(), &["ls-remote", &fx.url("missing")]);
+    assert!(!output.status.success(), "ls-remote of a missing repository succeeded");
+}
+
+#[test]
+fn the_dumb_protocol_and_wrong_methods_are_refused() {
+    let Some(fx) = Fixture::start() else { return };
+    fx.create_repository("present.git", &[]);
+
+    assert_eq!(fx.http("GET", "/git/present/info/refs", &[], b"").0, 403);
+    assert_eq!(fx.http("GET", "/git/present/objects/info/packs", &[], b"").0, 404);
+
+    let (status, head, _) = fx.http("GET", "/git/present/git-upload-pack", &[], b"");
+    assert_eq!(status, 405);
+    assert!(head.to_ascii_lowercase().contains("allow: post"), "{head}");
+
+    let (status, head, _) = fx.http("POST", "/git/present/info/refs?service=git-upload-pack", &[], b"");
+    assert_eq!(status, 405);
+    assert!(head.to_ascii_lowercase().contains("allow: get"), "{head}");
+}
+
+/// Returns `line` as a packet line.
+fn pkt_line(line: &str) -> String {
+    format!("{:04x}{line}", line.len() + 4)
+}
+
+#[test]
+fn a_gzipped_request_is_decoded() {
+    let Some(fx) = Fixture::start() else { return };
+    fx.create_repository("demo.git", &[]);
+    let work = fx.clone("demo", "work", 2);
+    write_lines(&work, "file.txt", 10, "content");
+    fx.git(&work, &["add", "."]);
+    fx.git(&work, &["commit", "--quiet", "-m", "first"]);
+    fx.git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+
+    let request = format!(
+        "{}{}0001{}0000",
+        pkt_line("command=ls-refs\n"),
+        pkt_line("object-format=sha1\n"),
+        pkt_line("ref-prefix refs/heads/\n")
+    );
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(request.as_bytes()).unwrap();
+    let gzipped = encoder.finish().unwrap();
+    let headers = ["Git-Protocol: version=2", "Content-Encoding: gzip"];
+
+    let (status, _, body) = fx.http("POST", "/git/demo/git-upload-pack", &headers, &gzipped);
+    assert_eq!(status, 200);
+    let expected = format!("{} refs/heads/main", fx.head(&work));
+    assert!(
+        String::from_utf8_lossy(&body).contains(&expected),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _, _) = fx.http("POST", "/git/demo/git-upload-pack", &headers, b"not gzip");
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn names_that_need_encoding_are_served() {
+    let Some(fx) = Fixture::start() else { return };
+    fx.create_repository("my repo.git", &[]);
+    fx.create_repository("été", &[]);
+
+    for (name, url_name) in [("my repo.git", "my%20repo"), ("été", "%C3%A9t%C3%A9")] {
+        let work = fx.clone(url_name, "work", 2);
+        write_lines(&work, "file.txt", 10, name);
+        fx.git(&work, &["add", "."]);
+        fx.git(&work, &["commit", "--quiet", "-m", "first"]);
+        fx.git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+
+        let copy = fx.clone(url_name, "copy", 0);
+        assert_eq!(fx.head(&copy), fx.head(&work), "{name}");
+        fx.fsck(name);
+        fs::remove_dir_all(&work).unwrap();
+        fs::remove_dir_all(&copy).unwrap();
     }
 }

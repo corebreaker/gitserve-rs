@@ -1,6 +1,7 @@
 //! Stores: the place where the served repositories live.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
@@ -54,9 +55,13 @@ impl Store {
 
     /// Returns the lock of the repository in `dir`. The lock is not held across an access, and a panic of an
     /// access leaves the repository as Git would after a crash, so a poisoned lock is still used.
+    ///
+    /// Locks are keyed by the canonical path of the repository, so that every spelling of one directory gets its
+    /// lock: names differing by case on a case-insensitive file system, or reaching it through a symbolic link.
     fn lock(&self, dir: &Path) -> Arc<RwLock<()>> {
+        let key = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(locks.entry(dir.to_path_buf()).or_default())
+        Arc::clone(locks.entry(key).or_default())
     }
 }
 
@@ -99,6 +104,25 @@ mod tests {
 
         store.view("repo", |_| ()).unwrap();
         store.view("repo.git", |_| ()).unwrap();
+        assert_eq!(store.locks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn spellings_of_one_directory_share_its_lock() {
+        let root = tempfile::tempdir().unwrap();
+        make_repository(&root.path().join("repo"));
+        let store = Store::new(root.path());
+
+        store.view("repo", |_| ()).unwrap();
+        // Only a case-insensitive file system finds the repository under another case.
+        if repository::is_repository(&root.path().join("REPO")) {
+            store.view("REPO", |_| ()).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.path().join("repo"), root.path().join("link")).unwrap();
+            store.view("link", |_| ()).unwrap();
+        }
         assert_eq!(store.locks.lock().unwrap().len(), 1);
     }
 

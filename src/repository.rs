@@ -48,24 +48,46 @@ pub fn find_repository(root: &Path, name: &str) -> Result<PathBuf, LookupError> 
 }
 
 /// Returns the hash kind of the repository in `dir`, from the `extensions.objectFormat` entry of its `config`,
-/// which Git writes for a SHA-256 repository only.
+/// which Git writes for a SHA-256 repository only. As in Git, the last entry wins.
 pub fn hash_kind(dir: &Path) -> anyhow::Result<Kind> {
     let config = fs::read_to_string(dir.join("config"))?;
+    let mut section = String::new();
+    let mut format = None;
     for line in config.lines() {
+        let line = strip_comment(line).trim();
+        if let Some(header) = line.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+            section = header.0.trim().to_ascii_lowercase();
+            continue;
+        }
+
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
 
-        if key.trim().eq_ignore_ascii_case("objectformat") {
-            return match value.trim() {
-                "sha1" => Ok(Kind::Sha1),
-                "sha256" => Ok(Kind::Sha256),
-                other => anyhow::bail!("unknown object format {other:?} in {}", dir.display()),
-            };
+        if section == "extensions" && key.trim().eq_ignore_ascii_case("objectformat") {
+            format = Some(value.trim().trim_matches('"').to_string());
         }
     }
 
-    Ok(Kind::Sha1)
+    match format.as_deref() {
+        None | Some("sha1") => Ok(Kind::Sha1),
+        Some("sha256") => Ok(Kind::Sha256),
+        Some(other) => anyhow::bail!("unknown object format {other:?} in {}", dir.display()),
+    }
+}
+
+/// Returns `line` without its comment, which starts with `#` or `;` outside of a quoted string.
+fn strip_comment(line: &str) -> &str {
+    let mut quoted = false;
+    for (at, character) in line.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            '#' | ';' if !quoted => return &line[..at],
+            _ => {}
+        }
+    }
+
+    line
 }
 
 #[cfg(test)]
@@ -143,5 +165,28 @@ mod tests {
         assert_eq!(hash_kind(&sha1).unwrap(), Kind::Sha1);
         assert_eq!(hash_kind(&sha256).unwrap(), Kind::Sha256);
         assert!(hash_kind(&unknown).is_err());
+    }
+
+    #[test]
+    fn hash_kind_follows_the_syntax_of_git_config() {
+        let root = tempfile::tempdir().unwrap();
+        let cases = [
+            ("[extensions]\n\tobjectFormat = sha256 # SHA-256\n", Kind::Sha256),
+            ("[Extensions]\n\tobjectformat = \"sha256\" ; quoted\n", Kind::Sha256),
+            (
+                "[extensions]\n\tobjectFormat = sha256\n\tobjectFormat = sha1\n",
+                Kind::Sha1,
+            ),
+            ("[other]\n\tobjectFormat = sha256\n", Kind::Sha1),
+            (
+                "# objectFormat = sha256\n[extensions]\n; objectFormat = sha256\n",
+                Kind::Sha1,
+            ),
+        ];
+        for (at, (config, kind)) in cases.into_iter().enumerate() {
+            let dir = root.path().join(at.to_string());
+            make_repository(&dir, config);
+            assert_eq!(hash_kind(&dir).unwrap(), kind, "{config:?}");
+        }
     }
 }
