@@ -24,7 +24,7 @@ and it listens on all network interfaces.
 ## Installation
 
 ```bash
-cargo install --git https://github.com/corebreaker/gitserve-rs
+cargo install gitserve
 ```
 
 
@@ -109,7 +109,7 @@ CircleCI checks the formatting, runs clippy, builds and runs the tests, and repo
 
 ## License
 
-gitserve is licensed under the [GNU General Public License v3.0](LICENSE).
+gitserve is licensed under the [GNU General Public License v3.0](LICENSE) or any later version.
 It uses gunnar-wire, licensed under the AGPL-3.0:
 the source of a server built from it must be offered to its network users, which this repository does.
 
