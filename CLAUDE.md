@@ -116,6 +116,9 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
 - Merge with `gh pr merge <pr> --merge`, a merge commit, or with `--squash` when the user asks to combine commits,
   then delete the branch, which GitHub keeps after a merge. After a squash, `git branch -d` refuses the branch:
   delete it with `-D` once `git diff --quiet origin/main <branch>` confirms that `main` holds the same tree.
+- A release tags the merge commit on `main` (`v<version>`, with a GitHub release), then publishes the crate
+  from that commit with `cargo publish --locked`, after a `--dry-run`. The CI and Claude files are left out
+  of the package (`exclude` in `Cargo.toml`). The license is GPL-3.0-or-later.
 
 ## Architecture
 

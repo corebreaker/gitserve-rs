@@ -2,6 +2,13 @@
 name = "gitserve"
 version = "1.0.0"
 edition = "2024"
+description = "A little HTTP server exposing local bare Git repositories over the smart HTTP protocol"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/corebreaker/gitserve-rs"
+readme = "README.md"
+keywords = ["git", "http", "server", "repository"]
+categories = ["command-line-utilities", "development-tools", "web-programming::http-server"]
+exclude = [".circleci/", ".github/", "CLAUDE.md"]
 
 [dependencies]
 anyhow = "1.0"
