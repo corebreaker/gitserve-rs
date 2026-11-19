@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use gitserve::store::{self, Store};
+use gitserve::store::{self, Applied, Store};
 use gitserve::{repository, server};
 
 /// The port that `serve` listens on by default.
@@ -11,8 +11,9 @@ const DEFAULT_PORT: u16 = 8085;
 /// Serve local bare Git repositories over HTTP.
 ///
 /// gitserve serves bare Git repositories over the smart HTTP protocol of Git, so that they can be cloned and pushed
-/// to without a forge, and without Git installed on the serving machine. The repositories live in a store,
-/// a directory.
+/// to without a forge, and without Git installed on the serving machine. The repositories live in a store:
+/// a directory, or a zip archive when its name ends with .zip. An archive is written back to its file after each
+/// change.
 #[derive(Debug, Parser)]
 #[command(name = "gitserve", version)]
 struct Cli {
@@ -35,14 +36,16 @@ enum Command {
         /// URL path under which the repositories are served.
         #[arg(long, default_value = "/")]
         prefix: String,
-        /// Directory holding the repositories.
+        /// Directory or zip archive holding the repositories.
         store: PathBuf,
     },
     /// Create an empty store.
     ///
-    /// Create an empty store, along with its missing parent directories.
+    /// Create an empty store, along with its missing parent directories: a directory, or a zip archive when the
+    /// name ends with .zip. An archive holds the repositories at its root, as a directory does, next to a .gitserve
+    /// file that records the version of the archive format.
     Init {
-        /// Directory to create.
+        /// Directory or zip archive to create.
         store: PathBuf,
     },
     /// Create bare repositories.
@@ -53,7 +56,7 @@ enum Command {
         /// Branch that HEAD points to in the new repositories.
         #[arg(short, long, default_value = "main", value_parser = parse_branch)]
         branch: String,
-        /// Directory holding the repositories.
+        /// Directory or zip archive holding the repositories.
         store: PathBuf,
         /// Names of the repositories to create.
         #[arg(required = true)]
@@ -64,7 +67,7 @@ enum Command {
     /// Delete repositories from a store, with all their content. As when serving, a name also designates the
     /// repository that bears it followed by .git.
     Delete {
-        /// Directory holding the repositories.
+        /// Directory or zip archive holding the repositories.
         store: PathBuf,
         /// Names of the repositories to delete.
         #[arg(required = true)]
@@ -72,7 +75,7 @@ enum Command {
     },
     /// List the repositories of a store.
     List {
-        /// Directory holding the repositories.
+        /// Directory or zip archive holding the repositories.
         store: PathBuf,
     },
 }
@@ -134,20 +137,12 @@ fn create(path: &Path, names: &[String], branch: &str) -> anyhow::Result<()> {
         println!("Initialized empty store {}", path.display());
     }
 
-    let store = Store::open(path)?;
-    apply(names, |name| {
-        store.create_repository(name, branch)?;
-        Ok(format!("Created repository {name}"))
-    })
+    report(Store::open(path)?.create_repositories(names, branch))
 }
 
 /// Deletes the repositories `names` from the store at `path`.
 fn delete(path: &Path, names: &[String]) -> anyhow::Result<()> {
-    let store = Store::open(path)?;
-    apply(names, |name| {
-        let dir = store.delete_repository(name)?;
-        Ok(format!("Deleted repository {dir}"))
-    })
+    report(Store::open(path)?.delete_repositories(names))
 }
 
 /// Prints the repositories of the store at `path`.
@@ -158,23 +153,18 @@ fn list(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Runs `action` on each name, printing what it reports, and goes on with the other names when one fails:
-/// it reports each failure, and fails once all are done.
-fn apply(names: &[String], mut action: impl FnMut(&str) -> anyhow::Result<String>) -> anyhow::Result<()> {
-    let mut failures = 0;
-    for name in names {
-        match action(name) {
-            Ok(report) => println!("{report}"),
-            Err(err) => {
-                eprintln!("Error: {name}: {err:#}");
-                failures += 1;
-            }
-        }
+/// Prints what an operation on several repositories did, then each of its failures, and fails if any.
+fn report(applied: Applied) -> anyhow::Result<()> {
+    for report in &applied.done {
+        println!("{report}");
+    }
+    for err in &applied.errors {
+        eprintln!("Error: {err:#}");
     }
 
-    match failures {
+    match applied.errors.len() {
         0 => Ok(()),
         1 => anyhow::bail!("1 repository failed"),
-        _ => anyhow::bail!("{failures} repositories failed"),
+        failures => anyhow::bail!("{failures} repositories failed"),
     }
 }

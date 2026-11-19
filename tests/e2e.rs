@@ -22,8 +22,14 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Starts a server, or returns `None` when `git` is missing outside of the CI.
+    /// Starts a server on the directory store `root`, or returns `None` when `git` is missing outside of the CI.
     fn start() -> Option<Self> {
+        Self::start_with("root", |path| fs::create_dir(path).unwrap())
+    }
+
+    /// Starts a server on the store at `store` in the directory of the fixture, which `prepare` makes, or returns
+    /// `None` when `git` is missing outside of the CI.
+    fn start_with(store: &str, prepare: impl FnOnce(&Path)) -> Option<Self> {
         if Command::new("git").arg("--version").output().is_err() {
             assert!(std::env::var_os("CI").is_none(), "git is required on the CI");
             eprintln!("git is missing: skipping the end-to-end test");
@@ -31,7 +37,11 @@ impl Fixture {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join("root")).unwrap();
+        let store = dir.path().join(store);
+        if let Some(parent) = store.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        prepare(&store);
         fs::write(
             dir.path().join("gitconfig"),
             "[user]\n\tname = Test\n\temail = test@example.com\n\
@@ -39,14 +49,14 @@ impl Fixture {
         )
         .unwrap();
 
-        let root = dir.path().join("root");
+        let store = Store::open(&store).unwrap();
         let (port_sender, port_receiver) = mpsc::channel();
         thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             runtime.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
                 port_sender.send(listener.local_addr().unwrap().port()).unwrap();
-                server::serve(listener, server::router(Store::new(root), "/git/".to_string()))
+                server::serve(listener, server::router(store, "/git/".to_string()))
                     .await
                     .unwrap();
             });
@@ -433,9 +443,9 @@ fn commands_initialize_stores() {
     let (code, _, err) = run_gitserve(dir.path(), &["list", "stores/missing"]);
     assert_eq!(code, 1);
     assert!(err.contains("does not exist"), "{err}");
-    let (code, _, err) = run_gitserve(dir.path(), &["init", "repos.zip"]);
-    assert_eq!(code, 1);
-    assert!(err.contains("not supported yet"), "{err}");
+    let (code, out, _) = run_gitserve(dir.path(), &["init", "repos.zip"]);
+    assert_eq!((code, out.as_str()), (0, "Initialized empty store repos.zip\n"));
+    assert!(dir.path().join("repos.zip").is_file());
 }
 
 #[test]
@@ -454,4 +464,145 @@ fn usage_errors_exit_with_2() {
         assert_eq!(run_gitserve(dir.path(), args).0, 2, "{args:?}");
     }
     assert_eq!(run_gitserve(dir.path(), &["list", "root"]).1, "");
+}
+
+/// Starts a server on the archive store `store/repos.zip` holding the repositories `names`, created by the binary.
+fn start_archive(names: &[&str]) -> Option<Fixture> {
+    let fx = Fixture::start_with("store/repos.zip", |path| gitserve::store::init_store(path).unwrap())?;
+    if !names.is_empty() {
+        let mut args = vec!["create", "store/repos.zip"];
+        args.extend_from_slice(names);
+        assert_eq!(fx.gitserve(&args).0, 0);
+    }
+    Some(fx)
+}
+
+/// Runs `check` on the directory of the repository `name` of the archive at `path`, as read from its file.
+fn in_archive<T>(path: &Path, name: &str, check: impl FnOnce(&Path) -> T) -> T {
+    Store::open(path).unwrap().view(name, check).unwrap()
+}
+
+#[test]
+fn an_archive_store_is_served_and_written_back() {
+    // The repository is created by another process while the server runs: the server reloads the archive.
+    let Some(fx) = start_archive(&["demo.git"]) else { return };
+    let archive = fx.path("store/repos.zip");
+
+    let work = fx.clone("demo", "work", 2);
+    write_lines(&work, "file.txt", 2000, "first");
+    fx.git(&work, &["add", "."]);
+    fx.git(&work, &["commit", "--quiet", "-m", "first"]);
+    fx.git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+    write_lines(&work, "file.txt", 2000, "second");
+    fx.git(&work, &["commit", "--quiet", "-am", "second"]);
+    fx.git(&work, &["tag", "-a", "v1", "-m", "v1"]);
+    fx.git(&work, &["push", "--quiet", "origin", "HEAD:main", "v1"]);
+
+    // The archive file holds the pushes, which stock git reads.
+    let head = fx.head(&work);
+    let stored = in_archive(&archive, "demo", |dir| {
+        let git_dir = dir.to_string_lossy().into_owned();
+        fx.git(
+            fx.dir.path(),
+            &["--git-dir", &git_dir, "fsck", "--strict", "--full", "--no-progress"],
+        );
+        fx.git(
+            fx.dir.path(),
+            &["--git-dir", &git_dir, "rev-parse", "refs/heads/main", "refs/tags/v1^{}"],
+        )
+    });
+    assert_eq!(stored, format!("{head}\n{head}"));
+
+    let copy = fx.clone("demo.git", "copy", 0);
+    assert_eq!(fx.head(&copy), head);
+    assert_eq!(fx.gitserve(&["list", "store/repos.zip"]).1, "demo.git\n");
+
+    // A deletion by another process reaches the server too.
+    assert_eq!(fx.gitserve(&["delete", "store/repos.zip", "demo"]).0, 0);
+    let output = fx.try_git(fx.dir.path(), &["ls-remote", &fx.url("demo")]);
+    assert!(!output.status.success(), "a deleted repository is still served");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_push_that_cannot_be_saved_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(fx) = start_archive(&["demo"]) else { return };
+    let work = fx.clone("demo", "work", 2);
+    write_lines(&work, "file.txt", 10, "first");
+    fx.git(&work, &["add", "."]);
+    fx.git(&work, &["commit", "--quiet", "-m", "first"]);
+    fx.git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+    let saved = fx.head(&work);
+
+    write_lines(&work, "file.txt", 10, "lost");
+    fx.git(&work, &["commit", "--quiet", "-am", "lost"]);
+    // The archive cannot be replaced while its directory is read-only, unless the tests run as root.
+    let store = fx.path("store");
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(store.join("probe"), "").is_ok() {
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("a read-only directory is still writable (root?): skipping the test");
+        return;
+    }
+    let pushed = fx.try_git(&work, &["push", "origin", "HEAD:main"]);
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&pushed.stderr);
+    assert!(
+        !pushed.status.success(),
+        "a push that was not saved succeeded: {stderr}"
+    );
+    assert!(stderr.contains("could not be saved"), "{stderr}");
+    // The push is discarded: the server serves the archive file as it is.
+    let served = fx.git(&work, &["ls-remote", "origin", "refs/heads/main"]);
+    assert_eq!(served.split('\t').next(), Some(saved.as_str()));
+}
+
+/// The commit at the head of the `demo` repository of `tests/fixtures/go-store.zip`, an archive made by the Go
+/// project: `gitserve create go-store.zip demo team/tools.git`, then a push of that commit and of an annotated tag
+/// `v1` to `demo`.
+const GO_FIXTURE_HEAD: &str = "262eda9e732ed80f1879d2452be3c75030e4b18e";
+
+#[test]
+fn an_archive_of_the_go_project_is_served() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-store.zip");
+    let Some(fx) = Fixture::start_with("go-store.zip", |path| {
+        fs::copy(&fixture, path).unwrap();
+    }) else {
+        return;
+    };
+    let archive = fx.path("go-store.zip");
+
+    assert_eq!(fx.gitserve(&["list", "go-store.zip"]).1, "demo\nteam/tools.git\n");
+    let work = fx.clone("demo", "work", 2);
+    assert_eq!(fx.head(&work), GO_FIXTURE_HEAD);
+    assert_eq!(fx.git(&work, &["describe", "--tags"]), "v1");
+
+    write_lines(&work, "file.txt", 10, "rust");
+    fx.git(&work, &["add", "."]);
+    fx.git(&work, &["commit", "--quiet", "-m", "Pushed to gitserve-rs"]);
+    fx.git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+
+    // The archive keeps the format of the Go project, and holds both pushes.
+    let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+    let mut marker = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name(".gitserve").unwrap(), &mut marker).unwrap();
+    assert_eq!(marker, "{\"version\":1}\n");
+    let head = fx.head(&work);
+    let stored = in_archive(&archive, "demo", |dir| {
+        let git_dir = dir.to_string_lossy().into_owned();
+        fx.git(
+            fx.dir.path(),
+            &["--git-dir", &git_dir, "fsck", "--strict", "--full", "--no-progress"],
+        );
+        fx.git(
+            fx.dir.path(),
+            &["--git-dir", &git_dir, "rev-list", "--count", "refs/heads/main"],
+        )
+    });
+    assert_eq!(stored, "2");
+    assert_eq!(fx.git(&work, &["rev-parse", "HEAD~1"]), GO_FIXTURE_HEAD);
+    assert_ne!(head, GO_FIXTURE_HEAD);
 }
