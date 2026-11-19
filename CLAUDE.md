@@ -147,6 +147,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   Another process writing the archive between a reload and a write of the server is not detected: its change is lost.
   `Store::close` lets a change in progress complete, and refuses the later accesses with `AccessError::Closed`
   (a 503) rather than holding them back: their tasks then end and release the store, whose drop removes the image.
+  A closed store refuses before looking a repository up or reloading an archive.
 - `archive.rs` converts between zip and a directory, with the format of the Go project, in both directions:
   the repositories at the root, a `.gitserve` marker recording the format version (`{"version":1}`, added to an
   archive without marker on its next write), files under the `objects` directory of a repository stored without
@@ -175,10 +176,13 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   A usage error exits with 2 (an invalid branch name included), a failed command with 1;
   `create` and `delete` go on with the other names when one fails, then exit with 1.
   The server listens on `0.0.0.0:<port>`, 8085 by default, and logs each request with its status code.
-- Graceful shutdown: `run_server` installs the handlers of SIGINT and SIGTERM (Ctrl+C and the closing of the console
-  on Windows) before serving. `server::serve` takes the shutdown as a future, so that tests drive it
-  (`tests/shutdown.rs`): it stops accepting connections, gives the requests in flight `SHUTDOWN_GRACE` (5 s),
-  then returns. axum runs each connection in a task of its own, so the connections left open are closed when
-  the runtime is dropped. `run_server` then calls `Store::close`, drops the runtime, which waits for its blocking
+- Graceful shutdown: `watch_signals` (`main.rs`) watches SIGINT and SIGTERM (Ctrl+C and the closing of the console
+  on Windows) in a thread of its own, with a runtime of its own, installed before serving: the first signal starts
+  the shutdown, a second one exits at once with 1, whatever the shutdown waits for (the main runtime, waiting for
+  its blocking tasks, could not handle it). `server::serve` takes the shutdown as a future, so that tests drive it
+  (`tests/shutdown.rs`, whose routes tell the test when they start rather than relying on delays):
+  it stops accepting connections, gives the requests in flight `SHUTDOWN_GRACE` (5 s), then returns;
+  dropping its future before the end stops the server too.
+  axum runs each connection in a task of its own, so the connections left open are closed when the runtime is dropped. `run_server` then calls `Store::close`, drops the runtime, which waits for its blocking
   tasks (a push in progress completes, even if its response can no longer be sent), and drops the store last.
   A signal exits with 0; serving that fails on its own, such as a port already taken, exits with 1.

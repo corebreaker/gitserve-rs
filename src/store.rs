@@ -159,17 +159,20 @@ impl Store {
     pub fn view<T>(&self, name: &str, access: impl FnOnce(&Path) -> T) -> Result<T, AccessError> {
         match &self.backend {
             Backend::Directory(directory) => {
+                self.check_open()?;
                 let dir = repository::find_repository(&directory.root, name)?;
                 let lock = directory.lock(&dir);
                 let _guard = lock.read().unwrap_or_else(PoisonError::into_inner);
                 self.check_open()?;
                 Ok(access(&dir))
             }
-            Backend::Archive(archive) => archive.read(|root| {
-                self.check_open()?;
-                let dir = repository::find_repository(root, name)?;
-                Ok(access(&dir))
-            })?,
+            Backend::Archive(archive) => archive.read(
+                || self.check_open(),
+                |root| {
+                    let dir = repository::find_repository(root, name)?;
+                    Ok(access(&dir))
+                },
+            )?,
         }
     }
 
@@ -180,6 +183,7 @@ impl Store {
     pub fn change<T>(&self, name: &str, access: impl FnOnce(&Path) -> T) -> Result<Changed<T>, AccessError> {
         match &self.backend {
             Backend::Directory(directory) => {
+                self.check_open()?;
                 let dir = repository::find_repository(&directory.root, name)?;
                 let lock = directory.lock(&dir);
                 let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
@@ -189,11 +193,13 @@ impl Store {
                     saved: Ok(()),
                 })
             }
-            Backend::Archive(archive) => archive.write(|root| {
-                self.check_open()?;
-                let dir = repository::find_repository(root, name)?;
-                Ok(access(&dir))
-            }),
+            Backend::Archive(archive) => archive.write(
+                || self.check_open(),
+                |root| {
+                    let dir = repository::find_repository(root, name)?;
+                    Ok(access(&dir))
+                },
+            ),
         }
     }
 
@@ -290,10 +296,12 @@ impl Store {
         self.check_open()?;
         match &self.backend {
             Backend::Directory(directory) => repository::list_repositories(&directory.root),
-            Backend::Archive(archive) => archive.read(repository::list_repositories).map_err(|err| match err {
-                AccessError::Load(err) => err,
-                err => err.into(),
-            })?,
+            Backend::Archive(archive) => archive
+                .read(|| self.check_open(), repository::list_repositories)
+                .map_err(|err| match err {
+                    AccessError::Load(err) => err,
+                    err => err.into(),
+                })?,
         }
     }
 
@@ -394,22 +402,36 @@ impl Archive {
 
     /// Runs `access` on the root of the image, shared with other reads. Reloading a changed archive replaces the
     /// image: it needs exclusive access, under which `access` then runs.
-    fn read<T>(&self, access: impl FnOnce(&Path) -> T) -> Result<T, AccessError> {
+    ///
+    /// `open` runs under the lock, before any reload: a closed store refuses the access without extracting the archive.
+    fn read<T>(
+        &self,
+        open: impl Fn() -> Result<(), AccessError>,
+        access: impl FnOnce(&Path) -> T,
+    ) -> Result<T, AccessError> {
         {
             let image = self.image.read().unwrap_or_else(PoisonError::into_inner);
+            open()?;
             if self.is_fresh(&image) {
                 return Ok(access(image.dir.path()));
             }
         }
 
         let mut image = self.image.write().unwrap_or_else(PoisonError::into_inner);
+        open()?;
         self.reload_if_changed(&mut image).map_err(AccessError::Load)?;
         Ok(access(image.dir.path()))
     }
 
     /// Runs `access` on the root of the image, with exclusive access, then writes the image back to the file.
-    fn write<T>(&self, access: impl FnOnce(&Path) -> Result<T, AccessError>) -> Result<Changed<T>, AccessError> {
+    /// `open` runs under the lock, before any reload, as for [`Archive::read`].
+    fn write<T>(
+        &self,
+        open: impl FnOnce() -> Result<(), AccessError>,
+        access: impl FnOnce(&Path) -> Result<T, AccessError>,
+    ) -> Result<Changed<T>, AccessError> {
         let mut image = self.image.write().unwrap_or_else(PoisonError::into_inner);
+        open()?;
         self.reload_if_changed(&mut image).map_err(AccessError::Load)?;
         let value = image.change(access)?;
         let saved = self.persist(&mut image);
@@ -629,6 +651,22 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_archive_store_refuses_without_reloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.zip");
+        init_store(&path).unwrap();
+        let store = Store::open(&path).unwrap();
+        store.create_repositories(&names(&["repo"]), "main");
+
+        // A file that cannot be loaded: an access that reloaded it would fail with AccessError::Load.
+        store.close();
+        fs::write(&path, "not a zip archive").unwrap();
+        assert!(matches!(store.view("repo", |_| ()), Err(AccessError::Closed)));
+        assert!(matches!(store.change("repo", |_| ()), Err(AccessError::Closed)));
+        assert!(matches!(store.view("missing", |_| ()), Err(AccessError::Closed)));
+    }
+
+    #[test]
     fn a_closed_directory_store_refuses_accesses() {
         let root = tempfile::tempdir().unwrap();
         make_repository(&root.path().join("repo"));
@@ -637,6 +675,8 @@ mod tests {
         store.close();
         assert!(matches!(store.view("repo", |_| ()), Err(AccessError::Closed)));
         assert!(matches!(store.change("repo", |_| ()), Err(AccessError::Closed)));
+        // A closed store refuses before looking the repository up.
+        assert!(matches!(store.view("missing", |_| ()), Err(AccessError::Closed)));
         assert!(store.repositories().is_err());
         assert_eq!(store.delete_repositories(&names(&["repo"])).errors.len(), 1);
         assert!(root.path().join("repo").exists());

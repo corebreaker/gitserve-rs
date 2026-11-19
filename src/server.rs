@@ -180,24 +180,33 @@ pub async fn serve(
             // A dropped sender stops the server as well.
             let _ = stopped.await;
         });
-    let mut server = tokio::spawn(async move { server.await });
+    // Dropping the future of `serve` before it completes, in a `select!` for instance, stops the server too.
+    let mut server = AbortOnDrop(tokio::spawn(async move { server.await }));
 
     tokio::select! {
-        served = &mut server => return served.map_err(std::io::Error::other)?,
+        served = &mut server.0 => return served.map_err(std::io::Error::other)?,
         () = shutdown => {}
     }
 
     let _ = stop.send(());
-    match tokio::time::timeout(grace, &mut server).await {
+    match tokio::time::timeout(grace, &mut server.0).await {
         Ok(served) => served.map_err(std::io::Error::other)?,
         Err(_) => {
             log::warn!(
                 "Requests in flight outlasted {} s: their connections are closed",
                 grace.as_secs_f32()
             );
-            server.abort();
             Ok(())
         }
+    }
+}
+
+/// A task that is aborted when dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
