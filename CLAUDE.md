@@ -15,9 +15,11 @@ served with zero setup so that collaborators can clone and push without a forge.
 Security is deliberately out of scope: no authentication, no access control,
 and listening on all interfaces is intended. Do not add them, and do not flag their absence in reviews.
 
-The crate holds a library (`src/lib.rs`) and the binary (`src/main.rs`), which only calls the library.
-The translation is in progress: the Git library that implements the protocol is not chosen yet,
-and the Architecture section below will describe it once it is.
+The crate holds a library (`src/lib.rs`) and the binary (`src/main.rs`, command line), one module per concern,
+each with its unit tests: `server.rs` (HTTP), `store.rs` (stores), `repository.rs` (repositories)
+and `ingest.rs` (pushed packs). `tests/e2e.rs` drives the real `git` client against the server.
+The translation is in progress: zip archive stores, the commands other than `serve` and the graceful shutdown
+of the Go project are still to come.
 
 ## Language
 
@@ -32,7 +34,12 @@ cargo fmt --all                                   # format the sources
 cargo clippy --all-targets -- -D warnings         # static checks, warnings included
 cargo test                                        # all tests
 cargo test <filter>                               # run only the tests whose name contains <filter>
+cargo run -- serve gitroot                        # serve ./gitroot on port 8085 (foreground)
+cargo run -- serve -p 9000 --prefix git gitroot   # serve it on port 9000, under the URL path /git/
 ```
+
+The end-to-end tests need `git`: they are skipped without it, except on CI (when `CI` is set).
+The log level follows `RUST_LOG`, `info` by default.
 
 Sources follow standard Rust formatting: run `cargo fmt --all` before committing, the CI rejects unformatted code,
 as well as any clippy warning. Lines stay within 120 columns, code included.
@@ -102,5 +109,26 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
 
 ## Architecture
 
-To be written as the translation progresses. The Git protocol itself must come from a library:
-gitserve only routes the smart HTTP endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`) to it.
+- Git itself is not implemented here. gitoxide (`gix`) has no server side, so the protocol comes from `gunnar-wire`,
+  the server-side state machines of `upload-pack` (protocol v2, with a v0 fallback) and `receive-pack` (v0),
+  run in stateless-rpc mode (`Session::StatelessRpc`), and the storage from `storage-git-gix`,
+  whose `GixStore` reads and writes an ordinary bare repository with `gix-odb` and `gix-ref`.
+  `gunnar-wire` and `gunnar-store` are licensed under AGPL-3.0-only, compatible with the GPL-3.0 of gitserve:
+  the combined program must offer its source to its network users, which the public repository does.
+- `server.rs`: `route` maps the smart HTTP endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`)
+  found under the URL prefix, which it strips, to a `GitRequest`; the dumb protocol is refused with a 403.
+  `handle` reads the whole request (gunzipped when needed) before accessing the store, runs the service
+  in `spawn_blocking`, since the state machines block, and sends the response once the access is over:
+  no network transfer ever happens while a repository is locked, so a slow client cannot stall the others.
+  When a service fails after writing a response, that response is still sent, since it reports the failure
+  to the client. The `# service=` announcement of an advertisement is written by gitserve, for protocol v0 only.
+- `store.rs`: a `Store` is a directory of repositories, with one `RwLock` per repository: `view` gives shared
+  access, `change` exclusive access; a push runs under `change`, since `storage-git-gix` takes no writer lock.
+  A `GixStore` is opened for each request, so that it sees what other processes wrote.
+- `repository.rs`: a repository is a directory holding `HEAD` and `config` files. A name is a slash-separated path
+  checked by `check_name`; `find_repository` also tries it with a `.git` suffix. The hash kind (SHA-1 or SHA-256)
+  comes from `extensions.objectFormat` in `config`.
+- `ingest.rs`: `StoreIngest`, the `PackIngest` that takes a pushed pack into the store through `GitOps::put_pack`,
+  which completes a thin pack. Requests and packs are held in memory, unlike the spools of the Go project.
+- `main.rs`: the command line uses clap; a usage error exits with 2, a failed command with 1.
+  The server listens on `0.0.0.0:<port>`, 8085 by default, and logs each request with its status code.
