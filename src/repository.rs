@@ -90,6 +90,101 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+/// The start of the names of the directories in which repositories are built or torn down. `list_repositories`
+/// skips them.
+const STAGING_PREFIX: &str = ".gitserve-";
+
+/// Checks that `branch` can name the branch of a new repository.
+pub fn check_branch(branch: &str) -> anyhow::Result<()> {
+    let reference = format!("refs/heads/{branch}");
+    gix_validate::reference::branch_name(reference.as_str().into())
+        .map(|_| ())
+        .map_err(|_| anyhow::anyhow!("invalid branch name {branch:?}"))
+}
+
+/// Creates an empty bare repository named `name` in `root`, with `HEAD` pointing to `branch`.
+///
+/// The repository is built in a hidden directory next to it, then renamed into place: a server running on `root`
+/// meanwhile never sees it half made.
+pub fn create_repository(root: &Path, name: &str, branch: &str) -> anyhow::Result<()> {
+    check_name(name)?;
+    check_branch(branch)?;
+    if let Ok(dir) = find_repository(root, name) {
+        anyhow::bail!("repository {} already exists", relative_name(root, &dir));
+    }
+
+    let target = root.join(name);
+    if fs::symlink_metadata(&target).is_ok() {
+        anyhow::bail!("{name} already exists");
+    }
+
+    let mut ancestor = String::new();
+    for element in name.split('/').take(name.split('/').count() - 1) {
+        if !ancestor.is_empty() {
+            ancestor.push('/');
+        }
+        ancestor.push_str(element);
+        if is_repository(&root.join(&ancestor)) {
+            anyhow::bail!("{name} would be inside repository {ancestor}");
+        }
+    }
+
+    let parent = target.parent().unwrap_or(root);
+    fs::create_dir_all(parent)?;
+    let staging = tempfile::Builder::new().prefix(STAGING_PREFIX).tempdir_in(parent)?;
+    let store = storage_git_gix::GixStore::open_or_init(staging.path().join("repo"), Kind::Sha1)?;
+    drop(store);
+    fs::write(staging.path().join("repo/HEAD"), format!("ref: refs/heads/{branch}\n"))?;
+    fs::rename(staging.path().join("repo"), &target)?;
+    Ok(())
+}
+
+/// Deletes the repository served under `name` in `root`, with all its content, and returns its directory relative
+/// to `root`.
+///
+/// The repository is first renamed to a hidden directory, then deleted: a server running on `root` meanwhile sees
+/// it vanish at once, not half deleted.
+pub fn delete_repository(root: &Path, name: &str) -> anyhow::Result<String> {
+    let dir = find_repository(root, name)?;
+    let parent = dir.parent().unwrap_or(root);
+    let trash = tempfile::Builder::new().prefix(STAGING_PREFIX).tempdir_in(parent)?;
+    fs::rename(&dir, trash.path().join("repo"))?;
+    trash.close()?;
+    Ok(relative_name(root, &dir))
+}
+
+/// Returns the directories of the repositories under `root`, relative to it, with slashes, in lexical order.
+/// It does not look for repositories inside other ones, nor follows symbolic links.
+pub fn list_repositories(root: &Path) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let skipped = entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX);
+            if skipped || !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            if is_repository(&entry.path()) {
+                names.push(relative_name(root, &entry.path()));
+            } else {
+                pending.push(entry.path());
+            }
+        }
+    }
+
+    names.sort();
+    Ok(names)
+}
+
+/// Returns the path of `dir` relative to `root`, with slashes.
+fn relative_name(root: &Path, dir: &Path) -> String {
+    let relative = dir.strip_prefix(root).unwrap_or(dir);
+    let elements: Vec<_> = relative.iter().map(|element| element.to_string_lossy()).collect();
+    elements.join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +283,82 @@ mod tests {
             make_repository(&dir, config);
             assert_eq!(hash_kind(&dir).unwrap(), kind, "{config:?}");
         }
+    }
+
+    #[test]
+    fn check_branch_follows_git() {
+        for branch in ["main", "master", "feature/x", "release-1.0"] {
+            assert!(check_branch(branch).is_ok(), "{branch}");
+        }
+        for branch in ["", "HEAD", "a..b", "a b", "a~1", "-x/", "x.lock", "x/"] {
+            assert!(check_branch(branch).is_err(), "{branch:?}");
+        }
+    }
+
+    #[test]
+    fn create_repository_makes_a_bare_repository() {
+        let root = tempfile::tempdir().unwrap();
+        create_repository(root.path(), "team/project.git", "master").unwrap();
+
+        let dir = root.path().join("team/project.git");
+        assert!(is_repository(&dir));
+        assert!(dir.join("objects/pack").is_dir());
+        assert!(dir.join("refs/heads").is_dir());
+        assert_eq!(
+            fs::read_to_string(dir.join("HEAD")).unwrap(),
+            "ref: refs/heads/master\n"
+        );
+        assert_eq!(hash_kind(&dir).unwrap(), Kind::Sha1);
+        // Nothing is left of the directory in which the repository was built.
+        assert_eq!(fs::read_dir(root.path().join("team")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn create_repository_refuses_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        create_repository(root.path(), "repo.git", "main").unwrap();
+        fs::write(root.path().join("file"), "").unwrap();
+
+        let error = |name: &str| create_repository(root.path(), name, "main").unwrap_err().to_string();
+        assert_eq!(error("repo"), "repository repo.git already exists");
+        assert_eq!(error("repo.git"), "repository repo.git already exists");
+        assert_eq!(error("file"), "file already exists");
+        assert_eq!(
+            error("repo.git/inner"),
+            "repo.git/inner would be inside repository repo.git"
+        );
+        assert_eq!(error("../outside"), "invalid repository name: \"../outside\"");
+    }
+
+    #[test]
+    fn create_repository_checks_the_branch() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(create_repository(root.path(), "repo", "a..b").is_err());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn delete_repository_removes_it() {
+        let root = tempfile::tempdir().unwrap();
+        create_repository(root.path(), "team/repo.git", "main").unwrap();
+
+        assert_eq!(delete_repository(root.path(), "team/repo").unwrap(), "team/repo.git");
+        assert!(!root.path().join("team/repo.git").exists());
+        assert_eq!(fs::read_dir(root.path().join("team")).unwrap().count(), 0);
+        assert!(delete_repository(root.path(), "team/repo").is_err());
+    }
+
+    #[test]
+    fn list_repositories_sorts_and_skips_nested_ones() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["b.git", "a/z", "a/c.git"] {
+            create_repository(root.path(), name, "main").unwrap();
+        }
+        // Neither a repository inside another one, nor a directory being built, is listed.
+        make_repository(&root.path().join("b.git/nested"), "");
+        make_repository(&root.path().join(".gitserve-staging/repo"), "");
+        fs::create_dir_all(root.path().join("empty/dir")).unwrap();
+
+        assert_eq!(list_repositories(root.path()).unwrap(), ["a/c.git", "a/z", "b.git"]);
     }
 }

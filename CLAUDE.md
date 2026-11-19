@@ -18,8 +18,8 @@ and listening on all interfaces is intended. Do not add them, and do not flag th
 The crate holds a library (`src/lib.rs`) and the binary (`src/main.rs`, command line), one module per concern,
 each with its unit tests: `server.rs` (HTTP), `store.rs` (stores), `repository.rs` (repositories)
 and `ingest.rs` (pushed packs). `tests/e2e.rs` drives the real `git` client against the server.
-The translation is in progress: zip archive stores, the commands other than `serve` and the graceful shutdown
-of the Go project are still to come.
+The translation is in progress: zip archive stores (#6) and the graceful shutdown (#7) of the Go project
+are still to come; until then, a store whose path ends with `.zip` is refused.
 
 ## Language
 
@@ -36,6 +36,10 @@ cargo test                                        # all tests
 cargo test <filter>                               # run only the tests whose name contains <filter>
 cargo run -- serve gitroot                        # serve ./gitroot on port 8085 (foreground)
 cargo run -- serve -p 9000 --prefix git gitroot   # serve it on port 9000, under the URL path /git/
+cargo run -- init repos                           # create an empty store
+cargo run -- create -b master gitroot team/tools  # create a bare repository, HEAD on master (main by default)
+cargo run -- delete gitroot team/tools            # delete a repository, also found with a .git suffix
+cargo run -- list gitroot                         # list the repositories of a store
 ```
 
 The end-to-end tests need `git`: they are skipped without it, except on CI (when `CI` is set).
@@ -132,7 +136,15 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   checked by `check_name`; `find_repository` also tries it with a `.git` suffix. The hash kind (SHA-1 or SHA-256)
   comes from `extensions.objectFormat` in `config`. `GixStore` reads that entry again, with a plain scan that
   ignores sections and comments: a hand-written entry that only `hash_kind` understands still fails to open.
+  `create_repository` builds a repository with `GixStore::open_or_init`, without the `git` binary,
+  in a hidden `.gitserve-*` directory next to it, then renames it into place; `delete_repository` renames it away
+  before deleting it: a server running on the same store never sees a repository half made or half deleted.
+  A repository is never created inside another one; `list_repositories` skips nested and `.gitserve-*` ones.
 - `ingest.rs`: `StoreIngest`, the `PackIngest` that takes a pushed pack into the store through `GitOps::put_pack`,
   which completes a thin pack. Requests and packs are held in memory, unlike the spools of the Go project.
-- `main.rs`: the command line uses clap; a usage error exits with 2, a failed command with 1.
+- `store.rs` also holds `init_store`, `ensure_store` (`serve` and `create` initialize a missing store)
+  and `Store::open`.
+- `main.rs`: the command line uses clap: `serve`, `init`, `create`, `delete` and `list`.
+  A usage error exits with 2 (an invalid branch name included), a failed command with 1;
+  `create` and `delete` go on with the other names when one fails, then exit with 1.
   The server listens on `0.0.0.0:<port>`, 8085 by default, and logs each request with its status code.
