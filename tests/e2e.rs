@@ -242,15 +242,20 @@ fn a_sha256_repository_is_served() {
     let Some(fx) = Fixture::start() else { return };
     fx.create_repository("sha256", &["--object-format=sha256"]);
 
-    let work = fx.clone("sha256", "work", 2);
+    // The work repository is not cloned from the empty one: before Git 2.42, such a clone was made with SHA-1.
+    let work = fx.path("work");
+    fx.git(fx.dir.path(), &["init", "--quiet", "--object-format=sha256", "work"]);
+    fx.git(&work, &["remote", "add", "origin", &fx.url("sha256")]);
     write_lines(&work, "file.txt", 100, "content");
     fx.git(&work, &["add", "."]);
     fx.git(&work, &["commit", "--quiet", "-m", "first"]);
     fx.git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
 
-    let copy = fx.clone("sha256", "copy", 0);
-    assert_eq!(fx.head(&copy), fx.head(&work));
-    assert_eq!(fx.head(&copy).len(), 64);
+    for version in [0, 2] {
+        let copy = fx.clone("sha256", &format!("copy-v{version}"), version);
+        assert_eq!(fx.head(&copy), fx.head(&work));
+        assert_eq!(fx.head(&copy).len(), 64);
+    }
     fx.fsck("sha256");
 }
 
@@ -319,6 +324,23 @@ fn the_dumb_protocol_and_wrong_methods_are_refused() {
     let (status, head, _) = fx.http("POST", "/git/present/info/refs?service=git-upload-pack", &[], b"");
     assert_eq!(status, 405);
     assert!(head.to_ascii_lowercase().contains("allow: get"), "{head}");
+}
+
+#[test]
+fn a_truncated_request_is_refused() {
+    let Some(fx) = Fixture::start() else { return };
+    fx.create_repository("demo.git", &[]);
+
+    // The body announces more bytes than the client sends before closing its side of the connection.
+    let mut stream = TcpStream::connect(("127.0.0.1", fx.port)).unwrap();
+    let head = "POST /git/demo/git-upload-pack HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n";
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(b"0000").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
 }
 
 /// Returns `line` as a packet line.
@@ -424,6 +446,12 @@ fn create_goes_on_after_a_failure() {
     assert_eq!(code, 1);
     assert_eq!(out, "Created repository dup\nCreated repository other\n");
     assert!(err.contains("repository dup already exists"), "{err}");
+    assert!(err.contains("1 repository failed"), "{err}");
+
+    let (code, out, err) = run_gitserve(dir.path(), &["create", "root", "dup", "other"]);
+    assert_eq!(code, 1);
+    assert_eq!(out, "");
+    assert!(err.contains("2 repositories failed"), "{err}");
 }
 
 #[test]

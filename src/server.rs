@@ -596,6 +596,24 @@ mod tests {
         assert!(!requests_side_band(b""));
         assert!(!requests_side_band(b"zzzz"));
         assert!(!requests_side_band(b"0100short"));
+        assert!(!requests_side_band(b"000eno capability"));
+    }
+
+    #[test]
+    fn a_discarded_push_reports_on_the_side_band_only_when_asked() {
+        let zero = "0".repeat(40);
+        let request = |capabilities: &str| {
+            let line = format!("{zero} {zero} refs/heads/main\0{capabilities}\n");
+            format!("{:04x}{line}0000", line.len() + 4).into_bytes()
+        };
+
+        let (output, result) = discard_push(&request("side-band-64k"), anyhow::anyhow!("disk full"));
+        assert!(String::from_utf8_lossy(&output).contains("disk full"));
+        assert!(format!("{:#}", result.unwrap_err()).contains("discarded"));
+
+        let (output, result) = discard_push(&request("report-status"), anyhow::anyhow!("disk full"));
+        assert!(output.is_empty());
+        assert!(result.is_err());
     }
 
     #[test]
