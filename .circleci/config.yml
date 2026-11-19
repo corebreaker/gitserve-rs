@@ -1,0 +1,68 @@
+version: 2.1
+
+# The gitserve gate, split across jobs so a failure names the offending check.
+
+executors:
+  rust:
+    docker:
+      - image: cimg/rust:1.100
+        auth:
+          username: corebreaker
+          password: $DOCKERHUB_ACCESS_TOKEN
+
+commands:
+  cargo-deps:
+    description: "Restore, fetch and cache the Cargo dependencies"
+    steps:
+      - restore_cache:
+          keys:
+            - cargo-v1-{{ checksum "Cargo.lock" }}
+      - run:
+          name: Fetch dependencies
+          command: "cargo fetch --locked"
+      - save_cache:
+          key: cargo-v1-{{ checksum "Cargo.lock" }}
+          paths:
+            - "/home/circleci/.cargo/registry"
+            - "/home/circleci/.cargo/git"
+
+jobs:
+  lint:
+    executor: rust
+    steps:
+      - checkout
+      - cargo-deps
+      - run:
+          name: Show toolchain version
+          command: "rustc --version && cargo --version && cargo clippy --version"
+      - run:
+          name: Check formatting
+          command: "cargo fmt --all --check"
+      - run:
+          name: Clippy
+          command: "cargo clippy --locked --all-targets -- -D warnings"
+
+  build:
+    executor: rust
+    steps:
+      - checkout
+      - cargo-deps
+      - run:
+          name: Build
+          command: "cargo build --locked --release"
+
+  test:
+    executor: rust
+    steps:
+      - checkout
+      - cargo-deps
+      - run:
+          name: Run tests
+          command: "cargo test --locked"
+
+workflows:
+  all-checks:
+    jobs:
+      - lint
+      - build
+      - test
