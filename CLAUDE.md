@@ -19,7 +19,7 @@ The crate holds a library (`src/lib.rs`) and the binary (`src/main.rs`, command 
 each with its unit tests: `server.rs` (HTTP), `store.rs` (stores), `archive.rs` (zip archives),
 `repository.rs` (repositories) and `ingest.rs` (pushed packs). `tests/e2e.rs` drives the real `git` client
 against the server; `tests/fixtures/go-store.zip` is an archive made by the Go project (see `GO_FIXTURE_HEAD`).
-The translation is in progress: the graceful shutdown (#7) of the Go project is still to come.
+It covers the whole Go project: stores in directories and zip archives, the commands, and the graceful shutdown.
 
 ## Language
 
@@ -145,8 +145,9 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   when the client asked for one (an HTTP 500 otherwise): the push fails on the client,
   which displays the reason as a `remote:` message.
   Another process writing the archive between a reload and a write of the server is not detected: its change is lost.
-  `Store::close` waits for a change in progress and holds back the others; the image is removed when the store
-  is dropped, which only the graceful shutdown (#7) will do for `serve`.
+  `Store::close` lets a change in progress complete, and refuses the later accesses with `AccessError::Closed`
+  (a 503) rather than holding them back: their tasks then end and release the store, whose drop removes the image.
+  A closed store refuses before looking a repository up or reloading an archive.
 - `archive.rs` converts between zip and a directory, with the format of the Go project, in both directions:
   the repositories at the root, a `.gitserve` marker recording the format version (`{"version":1}`, added to an
   archive without marker on its next write), files under the `objects` directory of a repository stored without
@@ -175,3 +176,14 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   A usage error exits with 2 (an invalid branch name included), a failed command with 1;
   `create` and `delete` go on with the other names when one fails, then exit with 1.
   The server listens on `0.0.0.0:<port>`, 8085 by default, and logs each request with its status code.
+- Graceful shutdown: `watch_signals` (`main.rs`) watches SIGINT and SIGTERM (Ctrl+C and the closing of the console
+  on Windows) in a thread of its own, with a runtime of its own, installed before serving: the first signal starts
+  the shutdown, a second one exits at once with 1, whatever the shutdown waits for (the main runtime, waiting for
+  its blocking tasks, could not handle it). `server::serve` takes the shutdown as a future, so that tests drive it
+  (`tests/shutdown.rs`, whose routes tell the test when they start rather than relying on delays):
+  it stops accepting connections, gives the requests in flight `SHUTDOWN_GRACE` (5 s), then returns;
+  dropping its future before the end stops the server too.
+  axum runs each connection in a task of its own, so the connections left open are closed when the runtime is dropped.
+  `run_server` then calls `Store::close`, drops the runtime, which waits for its blocking tasks
+  (a push in progress completes, even if its response can no longer be sent), and drops the store last.
+  A signal exits with 0; serving that fails on its own, such as a port already taken, exits with 1.

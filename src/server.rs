@@ -4,6 +4,7 @@ use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
@@ -18,6 +19,7 @@ use gunnar_wire::{ProtocolVersion, Session};
 use percent_encoding::percent_decode_str;
 use storage_git_gix::GixStore;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 use crate::ingest::StoreIngest;
 use crate::repository;
@@ -143,22 +145,69 @@ fn query_service(query: Option<&str>) -> Option<Service> {
 
 /// The state shared by the handlers.
 struct AppState {
-    store: Store,
+    store: Arc<Store>,
     prefix: String,
 }
 
 /// Returns the router serving the repositories of `store` under the URL `prefix`, which starts and ends with a
 /// slash (see [`normalize_prefix`]).
-pub fn router(store: Store, prefix: String) -> Router {
+pub fn router(store: Arc<Store>, prefix: String) -> Router {
     Router::new()
         .fallback(handle)
         .with_state(Arc::new(AppState { store, prefix }))
         .layer(middleware::from_fn(log_request))
 }
 
-/// Serves `router` on `listener` until serving fails.
-pub async fn serve(listener: TcpListener, router: Router) -> std::io::Result<()> {
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await
+/// How long the requests in flight get to complete once a shutdown starts.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Serves `router` on `listener` until `shutdown` completes, then shuts the server down gracefully: it stops accepting
+/// connections, and gives the requests in flight `grace` to complete. It returns once they did or `grace` elapsed,
+/// or as soon as serving fails on its own.
+///
+/// The connections still open after `grace` are left to the runtime, which closes them when it is dropped: axum runs
+/// each connection in a task of its own. The blocking tasks, such as a push in progress, complete before the runtime
+/// is dropped, even if their response can no longer be sent.
+pub async fn serve(
+    listener: TcpListener,
+    router: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    grace: Duration,
+) -> std::io::Result<()> {
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move {
+            // A dropped sender stops the server as well.
+            let _ = stopped.await;
+        });
+    // Dropping the future of `serve` before it completes, in a `select!` for instance, stops the server too.
+    let mut server = AbortOnDrop(tokio::spawn(async move { server.await }));
+
+    tokio::select! {
+        served = &mut server.0 => return served.map_err(std::io::Error::other)?,
+        () = shutdown => {}
+    }
+
+    let _ = stop.send(());
+    match tokio::time::timeout(grace, &mut server.0).await {
+        Ok(served) => served.map_err(std::io::Error::other)?,
+        Err(_) => {
+            log::warn!(
+                "Requests in flight outlasted {} s: their connections are closed",
+                grace.as_secs_f32()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// A task that is aborted when dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Logs every request with the status code of its response.
@@ -231,6 +280,7 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request) -> Respons
             Ok((output, result)) => Served::Ran { output, result },
             Err(AccessError::Lookup(_)) => Served::NotFound,
             Err(AccessError::Load(err)) => Served::Failed(err),
+            Err(AccessError::Closed) => Served::Closed,
         }
     })
     .await;
@@ -238,6 +288,9 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request) -> Respons
     let (output, result) = match served {
         Ok(Served::Ran { output, result }) => (output, result),
         Ok(Served::NotFound) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(Served::Closed) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "the server is shutting down").into_response();
+        }
         Ok(Served::Failed(err)) => {
             log::error!("{} {}: {err:#}", request.service.as_str(), request.name);
             return (StatusCode::INTERNAL_SERVER_ERROR, "the request failed").into_response();
@@ -285,6 +338,8 @@ enum Served {
     NotFound,
     /// The store cannot be accessed.
     Failed(anyhow::Error),
+    /// The store is closed, as the server shuts down.
+    Closed,
     /// The service ran: its output, and whether it succeeded.
     Ran {
         output: Vec<u8>,
