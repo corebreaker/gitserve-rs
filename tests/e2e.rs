@@ -106,6 +106,11 @@ impl Fixture {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    /// Runs the gitserve binary in the directory of the fixture with `args` (see [`run_gitserve`]).
+    fn gitserve(&self, args: &[&str]) -> (i32, String, String) {
+        run_gitserve(self.dir.path(), args)
+    }
+
     /// Creates the bare repository `name` in the store, with extra `git init` arguments.
     fn create_repository(&self, name: &str, args: &[&str]) {
         let mut init = vec!["init", "--bare", "--quiet"];
@@ -133,6 +138,25 @@ impl Fixture {
             &["fsck", "--strict", "--full", "--no-progress"],
         );
     }
+}
+
+/// Runs the gitserve binary in `dir` with `args`, and returns its exit code and its standard output and error.
+fn run_gitserve(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_gitserve"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let text = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap();
+    (output.status.code().unwrap(), text(output.stdout), text(output.stderr))
+}
+
+/// Returns a directory holding an empty store `root`, for the tests that only run the binary: they need neither
+/// `git` nor a server, so they always run.
+fn workspace() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("root")).unwrap();
+    dir
 }
 
 /// Writes `lines` numbered lines tagged with `tag` to `dir/name`.
@@ -344,4 +368,90 @@ fn names_that_need_encoding_are_served() {
         fs::remove_dir_all(&work).unwrap();
         fs::remove_dir_all(&copy).unwrap();
     }
+}
+
+#[test]
+fn commands_create_list_and_delete_repositories() {
+    let Some(fx) = Fixture::start() else { return };
+
+    let (code, out, _) = fx.gitserve(&["create", "--branch", "master", "root", "team/tools", "plain.git"]);
+    assert_eq!(code, 0);
+    assert_eq!(out, "Created repository team/tools\nCreated repository plain.git\n");
+    assert_eq!(
+        fx.gitserve(&["list", "root"]),
+        (0, "plain.git\nteam/tools\n".to_string(), String::new())
+    );
+
+    // A created repository is served, with HEAD on the branch given to create.
+    let work = fx.clone("team/tools", "work", 2);
+    write_lines(&work, "file.txt", 10, "content");
+    fx.git(&work, &["add", "."]);
+    fx.git(&work, &["commit", "--quiet", "-m", "first"]);
+    fx.git(&work, &["push", "--quiet", "origin", "HEAD:master"]);
+    let copy = fx.clone("team/tools", "copy", 0);
+    assert_eq!(fx.head(&copy), fx.head(&work));
+    assert_eq!(fx.git(&copy, &["rev-parse", "--abbrev-ref", "HEAD"]), "master");
+    fx.fsck("team/tools");
+
+    let (code, out, _) = fx.gitserve(&["delete", "root", "plain"]);
+    assert_eq!((code, out.as_str()), (0, "Deleted repository plain.git\n"));
+    assert!(!fx.path("root/plain.git").exists());
+
+    // A failure does not stop the other names.
+    let (code, out, err) = fx.gitserve(&["delete", "root", "missing", "team/tools"]);
+    assert_eq!(code, 1);
+    assert_eq!(out, "Deleted repository team/tools\n");
+    assert!(err.contains("missing"), "{err}");
+    assert_eq!(fx.gitserve(&["list", "root"]), (0, String::new(), String::new()));
+}
+
+#[test]
+fn create_goes_on_after_a_failure() {
+    let dir = workspace();
+
+    let (code, out, err) = run_gitserve(dir.path(), &["create", "root", "dup", "dup", "other"]);
+    assert_eq!(code, 1);
+    assert_eq!(out, "Created repository dup\nCreated repository other\n");
+    assert!(err.contains("repository dup already exists"), "{err}");
+}
+
+#[test]
+fn commands_initialize_stores() {
+    let dir = workspace();
+
+    let (code, out, _) = run_gitserve(dir.path(), &["init", "stores/first"]);
+    assert_eq!((code, out.as_str()), (0, "Initialized empty store stores/first\n"));
+    assert!(dir.path().join("stores/first").is_dir());
+    let (code, _, err) = run_gitserve(dir.path(), &["init", "stores/first"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("already exists"), "{err}");
+
+    let (code, out, _) = run_gitserve(dir.path(), &["create", "stores/second", "repo"]);
+    assert_eq!(code, 0);
+    assert_eq!(out, "Initialized empty store stores/second\nCreated repository repo\n");
+
+    let (code, _, err) = run_gitserve(dir.path(), &["list", "stores/missing"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("does not exist"), "{err}");
+    let (code, _, err) = run_gitserve(dir.path(), &["init", "repos.zip"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("not supported yet"), "{err}");
+}
+
+#[test]
+fn usage_errors_exit_with_2() {
+    let dir = workspace();
+
+    for args in [
+        &["create", "--branch", "a..b", "root", "repo"][..],
+        &["create", "--branch=-x", "root", "repo"],
+        &["create", "root"],
+        &["delete", "root"],
+        &["list"],
+        &["serve", "--port", "70000", "root"],
+        &["unknown"],
+    ] {
+        assert_eq!(run_gitserve(dir.path(), args).0, 2, "{args:?}");
+    }
+    assert_eq!(run_gitserve(dir.path(), &["list", "root"]).1, "");
 }

@@ -7,6 +7,39 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::repository::{self, LookupError};
 
+/// Reports whether `path` names a zip archive store, by its extension.
+fn is_archive(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+}
+
+/// Fails for a zip archive store, which gitserve does not support yet.
+fn refuse_archive(path: &Path) -> anyhow::Result<()> {
+    if is_archive(path) {
+        anyhow::bail!("{}: zip archive stores are not supported yet", path.display());
+    }
+    Ok(())
+}
+
+/// Creates an empty store at `path`, along with its missing parent directories.
+pub fn init_store(path: &Path) -> anyhow::Result<()> {
+    if fs::symlink_metadata(path).is_ok() {
+        anyhow::bail!("{} already exists", path.display());
+    }
+    refuse_archive(path)?;
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+/// Creates an empty store at `path` when nothing exists there yet, and reports whether it did.
+pub fn ensure_store(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => init_store(path).map(|()| true),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// A directory holding bare repositories, which it serves under their path relative to it.
 ///
 /// Each repository has its own lock: reads share it, a push takes it alone, since the storage does not guard
@@ -26,9 +59,42 @@ impl Store {
         }
     }
 
+    /// Opens the existing store at `path`.
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        refuse_archive(path)?;
+        match fs::metadata(path) {
+            Ok(meta) if meta.is_dir() => Ok(Self::new(path)),
+            Ok(_) => anyhow::bail!("{} is neither a directory nor a zip archive", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!("{} does not exist", path.display())
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// The directory of the store.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Creates an empty bare repository named `name`, with `HEAD` pointing to `branch`.
+    pub fn create_repository(&self, name: &str, branch: &str) -> anyhow::Result<()> {
+        repository::create_repository(&self.root, name, branch)
+    }
+
+    /// Deletes the repository served under `name`, and returns its directory.
+    ///
+    /// The deletion waits for the requests that this `Store` serves on the repository. It cannot wait for those of
+    /// another process, such as a `serve` running on the same directory: there, the deletion renames the repository
+    /// away first, so that it vanishes at once. On Unix, a request already reading it then fails if it opens another
+    /// file of it; on Windows, the rename fails while a file of it is open, and so does the deletion.
+    pub fn delete_repository(&self, name: &str) -> anyhow::Result<String> {
+        self.change(name, |_| repository::delete_repository(&self.root, name))?
+    }
+
+    /// Returns the directories of the repositories of the store, in lexical order.
+    pub fn repositories(&self) -> anyhow::Result<Vec<String>> {
+        repository::list_repositories(&self.root)
     }
 
     /// Runs `access` on the directory of the repository served under `name`, which other reads may access at the
@@ -77,6 +143,47 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(dir.join("config"), "").unwrap();
+    }
+
+    #[test]
+    fn stores_are_initialized_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a/b/store");
+
+        assert!(Store::open(&path).unwrap_err().to_string().ends_with("does not exist"));
+        assert!(ensure_store(&path).unwrap());
+        assert!(path.is_dir());
+        assert!(!ensure_store(&path).unwrap());
+        assert!(init_store(&path).unwrap_err().to_string().ends_with("already exists"));
+        assert_eq!(Store::open(&path).unwrap().root(), path);
+
+        fs::write(dir.path().join("file"), "").unwrap();
+        let error = Store::open(&dir.path().join("file")).unwrap_err().to_string();
+        assert!(error.ends_with("is neither a directory nor a zip archive"), "{error}");
+    }
+
+    #[test]
+    fn archives_are_refused_for_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.ZIP");
+
+        assert!(init_store(&path).unwrap_err().to_string().contains("not supported yet"));
+        assert!(ensure_store(&path).is_err());
+        assert!(Store::open(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn repositories_are_created_listed_and_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path());
+
+        store.create_repository("b.git", "main").unwrap();
+        store.create_repository("a/repo", "main").unwrap();
+        assert_eq!(store.repositories().unwrap(), ["a/repo", "b.git"]);
+        assert_eq!(store.delete_repository("b").unwrap(), "b.git");
+        assert_eq!(store.repositories().unwrap(), ["a/repo"]);
+        assert!(store.delete_repository("b").is_err());
     }
 
     #[test]

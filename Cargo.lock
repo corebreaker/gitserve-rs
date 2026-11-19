@@ -550,6 +550,7 @@ dependencies = [
  "flate2",
  "git-storage-trait",
  "gix-hash",
+ "gix-validate",
  "gunnar-wire",
  "log",
  "percent-encoding",
