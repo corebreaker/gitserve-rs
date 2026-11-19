@@ -183,6 +183,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   (`tests/shutdown.rs`, whose routes tell the test when they start rather than relying on delays):
   it stops accepting connections, gives the requests in flight `SHUTDOWN_GRACE` (5 s), then returns;
   dropping its future before the end stops the server too.
-  axum runs each connection in a task of its own, so the connections left open are closed when the runtime is dropped. `run_server` then calls `Store::close`, drops the runtime, which waits for its blocking
-  tasks (a push in progress completes, even if its response can no longer be sent), and drops the store last.
+  axum runs each connection in a task of its own, so the connections left open are closed when the runtime is dropped.
+  `run_server` then calls `Store::close`, drops the runtime, which waits for its blocking tasks
+  (a push in progress completes, even if its response can no longer be sent), and drops the store last.
   A signal exits with 0; serving that fails on its own, such as a port already taken, exits with 1.
