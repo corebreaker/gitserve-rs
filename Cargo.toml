@@ -1,6 +1,6 @@
 [package]
 name = "gitserve"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "A little HTTP server exposing local bare Git repositories over the smart HTTP protocol"
 license = "GPL-3.0-or-later"
