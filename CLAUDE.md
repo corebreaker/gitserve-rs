@@ -137,16 +137,21 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
 - An archive store extracts the archive into a temporary directory, its image, under a single `RwLock`:
   writing the archive covers every repository. `change` writes the archive back to its file afterwards,
   and returns whether it did (`Changed::saved`); `create_repositories` and `delete_repositories` run all their names
-  in one change and write once. The image is reloaded when the size or the modification time of the file changes,
-  as when another gitserve command writes it. When a write fails, the stamp is cleared: the next access reloads
-  the file, which discards the change. The server then replaces the response to the push with an error
-  on the error band of the side-band, when the client asked for one (an HTTP 500 otherwise): the push fails
-  on the client, which displays the reason as a `remote:` message.
+  in one change and write once. The image is reloaded when the stamp of the file changes (size, modification time,
+  and the inode and change time on Unix or the creation time on Windows, since FAT has a 2-second modification time),
+  as when another gitserve command writes it. When a write fails, or a change panics, the stamp is cleared:
+  the next access reloads the file, which discards the change.
+  When the write of a push fails, the server replaces its response with an error on the error band of the side-band,
+  when the client asked for one (an HTTP 500 otherwise): the push fails on the client,
+  which displays the reason as a `remote:` message.
   Another process writing the archive between a reload and a write of the server is not detected: its change is lost.
+  `Store::close` waits for a change in progress and holds back the others; the image is removed when the store
+  is dropped, which only the graceful shutdown (#7) will do for `serve`.
 - `archive.rs` converts between zip and a directory, with the format of the Go project, in both directions:
   the repositories at the root, a `.gitserve` marker recording the format version (`{"version":1}`, added to an
-  archive without marker on its next write), files under `objects/` stored without compression.
-  An archive is written to a temporary file next to it, then renamed over it, keeping its permissions;
+  archive without marker on its next write), files under the `objects` directory of a repository stored without
+  compression (zip64 for an entry of 4 GiB or more). An archive is written to a temporary file next to it,
+  then renamed over it, keeping its permissions (0644 for a new archive on Unix);
   entries escaping the image are refused, and `.gitserve-*` directories are left out.
 - `repository.rs`: a repository is a directory holding `HEAD` and `config` files. A name is a slash-separated path
   checked by `check_name`; `find_repository` also tries it with a `.git` suffix. The hash kind (SHA-1 or SHA-256)
@@ -164,6 +169,8 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   which completes a thin pack. Requests and packs are held in memory, unlike the spools of the Go project.
 - `store.rs` also holds `init_store`, `ensure_store` (`serve` and `create` initialize a missing store)
   and `Store::open`.
+- The tests of a failed archive write make its directory read-only, which only works on Unix and not as root:
+  they skip themselves when the directory is still writable.
 - `main.rs`: the command line uses clap: `serve`, `init`, `create`, `delete` and `list`.
   A usage error exits with 2 (an invalid branch name included), a failed command with 1;
   `create` and `delete` go on with the other names when one fails, then exit with 1.

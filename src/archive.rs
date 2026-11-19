@@ -25,20 +25,52 @@ struct Marker {
 }
 
 /// Identifies a state of a file: it changes whenever the file is written.
+///
+/// The size and the modification time alone may miss a write: the modification time of FAT file systems, common on
+/// USB keys, has a resolution of 2 seconds. The stamp also holds what identifies the file itself, which changes when
+/// a write replaces it by renaming another file over it, as gitserve does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stamp {
     size: u64,
     modified: Option<SystemTime>,
+    identity: Identity,
 }
+
+/// What identifies a file beyond its content: its device, inode and change time on Unix.
+#[cfg(unix)]
+type Identity = (u64, u64, i64, i64);
+
+/// What identifies a file beyond its content: its creation time on Windows.
+#[cfg(windows)]
+type Identity = u64;
+
+#[cfg(not(any(unix, windows)))]
+type Identity = ();
 
 impl Stamp {
     fn of(meta: &fs::Metadata) -> Self {
         Self {
             size: meta.len(),
             modified: meta.modified().ok(),
+            identity: identity(meta),
         }
     }
 }
+
+#[cfg(unix)]
+fn identity(meta: &fs::Metadata) -> Identity {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+}
+
+#[cfg(windows)]
+fn identity(meta: &fs::Metadata) -> Identity {
+    use std::os::windows::fs::MetadataExt;
+    meta.creation_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn identity(_: &fs::Metadata) -> Identity {}
 
 /// Returns the stamp of the file at `path`.
 pub fn stamp(path: &Path) -> io::Result<Stamp> {
@@ -120,7 +152,8 @@ fn extract_entry(entry: &mut zip::read::ZipFile<'_, impl io::Read>, raw: &str, i
 /// Writes the directory `image` to the archive at `path`, and returns the stamp of the written file.
 ///
 /// The archive is first written to a temporary file next to it, that then replaces it: an interrupted write leaves
-/// the previous archive intact. The archive keeps the permissions of the file it replaces.
+/// the previous archive intact. The archive keeps the permissions of the file it replaces; a new archive is readable
+/// by everyone on Unix, as files usually are, rather than by its owner only, as temporary files are.
 pub fn write_archive(path: &Path, image: &Path) -> anyhow::Result<Stamp> {
     let write = || -> anyhow::Result<Stamp> {
         let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
@@ -132,11 +165,18 @@ pub fn write_archive(path: &Path, image: &Path) -> anyhow::Result<Stamp> {
             .tempfile_in(parent)?;
 
         let mut writer = ZipWriter::new(BufWriter::new(temporary));
-        zip_directory(&mut writer, image, image)?;
+        zip_directory(&mut writer, image, image, false)?;
         let temporary = writer.finish()?.into_inner().map_err(io::IntoInnerError::into_error)?;
         temporary.as_file().sync_all()?;
-        if let Ok(meta) = fs::metadata(path) {
-            fs::set_permissions(temporary.path(), meta.permissions())?;
+        match fs::metadata(path) {
+            Ok(meta) => fs::set_permissions(temporary.path(), meta.permissions())?,
+            #[cfg(unix)]
+            Err(_) => {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o644))?;
+            }
+            #[cfg(not(unix))]
+            Err(_) => {}
         }
 
         temporary.persist(path).map_err(|err| err.error)?;
@@ -159,9 +199,16 @@ pub fn create_archive(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Writes every directory and file under `dir` to `writer`, named after their path relative to `image`, in
-/// lexical order. Git objects are stored as they are, since Git already compresses them; the other files are
-/// deflated. The directories in which repositories are built or torn down are left out.
-fn zip_directory(writer: &mut ZipWriter<impl io::Write + io::Seek>, image: &Path, dir: &Path) -> anyhow::Result<()> {
+/// lexical order. Git objects, the files under the `objects` directory of a repository, are stored as they are, since
+/// Git already compresses them: `objects` tells whether `dir` is such a directory. The other files are deflated.
+/// The directories in which repositories are built or torn down are left out.
+fn zip_directory(
+    writer: &mut ZipWriter<impl io::Write + io::Seek>,
+    image: &Path,
+    dir: &Path,
+    objects: bool,
+) -> anyhow::Result<()> {
+    let in_repository = !objects && repository::is_repository(dir);
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<io::Result<_>>()?;
@@ -178,14 +225,24 @@ fn zip_directory(writer: &mut ZipWriter<impl io::Write + io::Seek>, image: &Path
         let options = SimpleFileOptions::default().last_modified_time(zip_time(meta.modified().ok()));
         if meta.is_dir() {
             writer.add_directory(format!("{name}/"), options.unix_permissions(0o755))?;
-            zip_directory(writer, image, &path)?;
+            zip_directory(
+                writer,
+                image,
+                &path,
+                objects || (in_repository && file_name == "objects"),
+            )?;
         } else if meta.is_file() {
-            let method = if format!("/{name}").contains("/objects/") {
+            let method = if objects {
                 CompressionMethod::Stored
             } else {
                 CompressionMethod::Deflated
             };
-            writer.start_file(name, options.unix_permissions(0o644).compression_method(method))?;
+            // An entry of 4 GiB or more, a large pack, needs the zip64 extension.
+            let options = options
+                .unix_permissions(0o644)
+                .compression_method(method)
+                .large_file(meta.len() >= u64::from(u32::MAX));
+            writer.start_file(name, options)?;
             io::copy(&mut File::open(&path)?, writer)?;
         }
     }
@@ -280,19 +337,66 @@ mod tests {
     fn objects_are_stored_and_other_files_deflated() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
-        fs::create_dir_all(source.join("repo/objects/ab")).unwrap();
-        fs::write(source.join("repo/objects/ab/cdef"), "object").unwrap();
-        fs::write(source.join("repo/config"), "[core]\n").unwrap();
+        let repository = |path: &str| {
+            fs::create_dir_all(source.join(path).join("objects/ab")).unwrap();
+            fs::write(source.join(path).join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            fs::write(source.join(path).join("config"), "[core]\n").unwrap();
+            fs::write(source.join(path).join("objects/ab/cdef"), "object").unwrap();
+        };
+        repository("repo");
+        // Repositories and directories named `objects`, which do not hold Git objects.
+        repository("objects");
+        repository("team/objects/repo.git");
         write_marker(&source).unwrap();
 
         let path = dir.path().join("repos.zip");
         write_archive(&path, &source).unwrap();
         let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
-        let method = |archive: &mut ZipArchive<File>, name: &str| archive.by_name(name).unwrap().compression();
-        assert_eq!(method(&mut archive, "repo/objects/ab/cdef"), CompressionMethod::Stored);
-        assert_eq!(method(&mut archive, "repo/config"), CompressionMethod::Deflated);
-        assert_eq!(method(&mut archive, MARKER), CompressionMethod::Deflated);
+        let mut method = |name: &str| archive.by_name(name).unwrap().compression();
+        for object in [
+            "repo/objects/ab/cdef",
+            "objects/objects/ab/cdef",
+            "team/objects/repo.git/objects/ab/cdef",
+        ] {
+            assert_eq!(method(object), CompressionMethod::Stored, "{object}");
+        }
+        for other in ["repo/config", "objects/HEAD", "team/objects/repo.git/config", MARKER] {
+            assert_eq!(method(other), CompressionMethod::Deflated, "{other}");
+        }
         assert!(archive.by_name("repo/objects/").unwrap().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archives_keep_their_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.zip");
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        create_archive(&path).unwrap();
+        assert_eq!(mode(&path), 0o644);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let image = tempfile::tempdir().unwrap();
+        read_archive(&path, image.path()).unwrap();
+        write_archive(&path, image.path()).unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn a_rewritten_archive_gets_another_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.zip");
+        create_archive(&path).unwrap();
+        let first = stamp(&path).unwrap();
+
+        // The same content written again: the size does not change, and the modification time may not either.
+        let image = tempfile::tempdir().unwrap();
+        read_archive(&path, image.path()).unwrap();
+        let second = write_archive(&path, image.path()).unwrap();
+        assert_eq!(first.size, second.size);
+        assert_ne!(first, second);
     }
 
     #[test]

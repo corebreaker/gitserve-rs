@@ -538,9 +538,14 @@ fn a_push_that_cannot_be_saved_fails() {
 
     write_lines(&work, "file.txt", 10, "lost");
     fx.git(&work, &["commit", "--quiet", "-am", "lost"]);
-    // The archive cannot be replaced while its directory is read-only.
+    // The archive cannot be replaced while its directory is read-only, unless the tests run as root.
     let store = fx.path("store");
     fs::set_permissions(&store, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(store.join("probe"), "").is_ok() {
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("a read-only directory is still writable (root?): skipping the test");
+        return;
+    }
     let pushed = fx.try_git(&work, &["push", "origin", "HEAD:main"]);
     fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
 

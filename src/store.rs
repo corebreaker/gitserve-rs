@@ -246,9 +246,11 @@ impl Store {
                     return applied;
                 }
 
-                for name in names {
-                    run(image.dir.path(), name);
-                }
+                image.change(|root| {
+                    for name in names {
+                        run(root, name);
+                    }
+                });
                 if !applied.done.is_empty()
                     && let Err(err) = archive.persist(&mut image)
                 {
@@ -272,12 +274,33 @@ impl Store {
         }
     }
 
-    /// Waits for the change in progress, if any, and prevents any other from starting, so that the process can
-    /// exit without interrupting the write of an archive.
+    /// Waits for the change in progress, if any, and prevents any other access to an archive store from starting,
+    /// so that the process can exit without interrupting the write of an archive. The image of an archive store is
+    /// left in the temporary directory: the store must be dropped to remove it.
     pub fn close(&self) {
         if let Backend::Archive(archive) = &self.backend {
             std::mem::forget(archive.image.write().unwrap_or_else(PoisonError::into_inner));
         }
+    }
+}
+
+impl Image {
+    /// Runs `change` on the root of the image. When `change` panics, the image may hold half of its changes:
+    /// its stamp is then cleared, so that the next access reloads the file and discards them, as after a failed
+    /// write, rather than a later change writing them to the archive.
+    fn change<T>(&mut self, change: impl FnOnce(&Path) -> T) -> T {
+        struct DiscardOnPanic<'a>(&'a mut Option<Stamp>);
+
+        impl Drop for DiscardOnPanic<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    *self.0 = None;
+                }
+            }
+        }
+
+        let _discard = DiscardOnPanic(&mut self.stamp);
+        change(self.dir.path())
     }
 }
 
@@ -352,7 +375,7 @@ impl Archive {
     fn write<T>(&self, access: impl FnOnce(&Path) -> Result<T, AccessError>) -> Result<Changed<T>, AccessError> {
         let mut image = self.image.write().unwrap_or_else(PoisonError::into_inner);
         self.reload_if_changed(&mut image).map_err(AccessError::Load)?;
-        let value = access(image.dir.path())?;
+        let value = image.change(access)?;
         let saved = self.persist(&mut image);
         Ok(Changed { value, saved })
     }
@@ -475,8 +498,13 @@ mod tests {
         let store = Store::open(&path).unwrap();
         store.create_repositories(&names(&["kept"]), "main");
 
-        // The archive cannot be replaced while its directory is read-only.
+        // The archive cannot be replaced while its directory is read-only, unless the tests run as root.
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(parent.join("probe"), "").is_ok() {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("a read-only directory is still writable (root?): skipping the test");
+            return;
+        }
         let created = store.create_repositories(&names(&["lost"]), "main");
         let changed = store
             .change("kept", |dir| fs::write(dir.join("description"), "lost"))
@@ -489,6 +517,68 @@ mod tests {
         assert_eq!(store.repositories().unwrap(), ["kept"]);
         let description = store.view("kept", |dir| dir.join("description").exists()).unwrap();
         assert!(!description);
+    }
+
+    #[test]
+    fn a_change_that_panics_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.zip");
+        init_store(&path).unwrap();
+        let store = Store::open(&path).unwrap();
+        store.create_repositories(&names(&["repo"]), "main");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.change("repo", |dir| {
+                fs::write(dir.join("description"), "half done").unwrap();
+                panic!("the change fails halfway");
+            })
+        }));
+        assert!(panicked.is_err());
+
+        // The next change does not write the half-done change to the archive: the image was reloaded first.
+        let changed = store.change("repo", |dir| dir.join("description").exists()).unwrap();
+        assert!(!changed.value);
+        assert!(changed.saved.is_ok());
+        let reopened = Store::open(&path).unwrap();
+        assert!(!reopened.view("repo", |dir| dir.join("description").exists()).unwrap());
+    }
+
+    #[test]
+    fn close_waits_for_the_change_in_progress_and_holds_back_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.zip");
+        init_store(&path).unwrap();
+        let store: &'static Store = Box::leak(Box::new(Store::open(&path).unwrap()));
+        store.create_repositories(&names(&["repo"]), "main");
+
+        let started = Arc::new(Barrier::new(2));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let change = {
+            let (started, finished) = (Arc::clone(&started), Arc::clone(&finished));
+            thread::spawn(move || {
+                store.change("repo", |_| {
+                    started.wait();
+                    thread::sleep(Duration::from_millis(100));
+                    finished.store(1, Ordering::SeqCst);
+                })
+            })
+        };
+
+        started.wait();
+        store.close();
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "close returned before the change in progress finished"
+        );
+        assert!(change.join().unwrap().unwrap().saved.is_ok());
+
+        // An access that starts after close never runs. Its thread stays blocked, and ends with the test process.
+        let accessed = Arc::new(AtomicUsize::new(0));
+        let access = Arc::clone(&accessed);
+        thread::spawn(move || store.view("repo", |_| access.store(1, Ordering::SeqCst)));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(accessed.load(Ordering::SeqCst), 0, "an access ran after close");
     }
 
     #[test]
